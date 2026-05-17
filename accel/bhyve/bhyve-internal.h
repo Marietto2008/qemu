@@ -33,11 +33,25 @@ struct bhyve_machine {
 
     // Track CPU vendor for MSR support
     enum host_vendor cpu_vendor;
+
+    /* Per-machine segment ID counter value (incremented on every vm_create_devmem)*/
+    int segid_num;
 };
 
 extern struct bhyve_machine bhyve_mach;
 
-/* Curent segment ID (incremented on every vm_create_devmem)*/
-extern int segid_num;
+/* Diagnostic counters from bhyve-i8259.c */
+extern volatile long pic_irq0_assert;
+extern volatile long pic_irq0_deassert;
+extern volatile long pic_other_irq;
+
+/* Pending ISA IRQ bitmask for userspace injection (bhyve-i8259.c) */
+extern volatile uint32_t bhyve_pic_pending_irqs;
+
+/* Pending IOAPIC IRQ bitmask for userspace injection (bhyve-ioapic.c) */
+extern volatile uint32_t bhyve_ioapic_pending_irqs;
+
+/* IOAPIC vector table — set by bhyve_ioapic_set_irq from QEMU's model */
+extern volatile uint8_t bhyve_ioapic_vectors[24];
 
 #endif /* TARGET_I386_BHYVE_INTERNAL_H */
