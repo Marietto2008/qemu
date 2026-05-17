@@ -3,7 +3,9 @@
 #include "hw/intc/i8259.h"
 #include "qemu/module.h"
 #include "system/bhyve.h"
-#include "hw/irq.h"
+#include "hw/core/irq.h"
+#include "hw/core/cpu.h"
+#include "exec/cpu-interrupt.h"
 #include "qom/object.h"
 #include "bhyve-internal.h"
 
@@ -40,20 +42,66 @@ static void bhyve_pic_reset(DeviceState *dev)
     bhyve_pic_put(s);
 }
 
+volatile long pic_irq0_assert = 0;
+volatile long pic_irq0_deassert = 0;
+volatile long pic_other_irq = 0;
+
+/*
+ * Bitmask of pending ISA IRQs for userspace injection.
+ * Set by bhyve_pic_set_irq when level=1, cleared by pre_run
+ * after injecting the vector into the vLAPIC.
+ */
+volatile uint32_t bhyve_pic_pending_irqs = 0;
+
 static void bhyve_pic_set_irq(void *opaque, int irq, int level)
 {
     int err;
     pic_stat_update_irq(irq, level);
-    /* TODO: Add IOAPIC support */
+
+    if (irq == 0) {
+        if (level) pic_irq0_assert++;
+        else pic_irq0_deassert++;
+    } else {
+        pic_other_irq++;
+    }
+
+    /* Log first few IRQ0 assertions to confirm PIT is firing */
+    if (irq == 0 && level && pic_irq0_assert <= 5) {
+        fprintf(stderr, "PIC: IRQ0 assert #%ld (PIT timer fired!)\n",
+                pic_irq0_assert);
+        fflush(stderr);
+    }
+    /* Log non-IRQ0 interrupts (first few) */
+    if (irq != 0 && pic_other_irq <= 10) {
+        fprintf(stderr, "PIC: IRQ%d %s (#%ld)\n", irq,
+                level ? "assert" : "deassert", pic_other_irq);
+        fflush(stderr);
+    }
+
     if (level) {
         err = vm_isa_assert_irq(bhyve_mach.vm, irq, -1);
+        /* Track pending IRQ for userspace injection in pre_run */
+        __atomic_or_fetch(&bhyve_pic_pending_irqs, (1u << irq), __ATOMIC_RELEASE);
     } else {
         err = vm_isa_deassert_irq(bhyve_mach.vm, irq, -1);
     }
 
+    /*
+     * Signal the CPU so it re-enters vm_run. Pre_run will read
+     * bhyve_pic_pending_irqs and inject the correct vector via
+     * vm_lapic_irq().
+     */
+    if (level) {
+        CPUState *cpu = first_cpu;
+        if (cpu) {
+            cpu_interrupt(cpu, CPU_INTERRUPT_HARD);
+        }
+    }
+
     if (err) {
-        fprintf(stderr, "bhyve: 8259 failed, irq (%d)",
-                irq);
+        fprintf(stderr, "bhyve: 8259 failed, irq (%d) err=%d errno=%d (%s)\n",
+                irq, err, errno, strerror(errno));
+        fflush(stderr);
     }
 }
 
