@@ -11,6 +11,7 @@ if have_system
   subdir('xen')
   subdir('stubs')
   subdir('mshv')
+  subdir('bhyve')
 endif
 
 # qtest
