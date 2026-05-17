@@ -31,6 +31,7 @@ static void *qemu_bhyve_cpu_thread_fn(void *arg) {
     r = bhyve_init_vcpu(cpu);
     if (r < 0) {
         fprintf(stderr, "bhyve_init_vcpu failed: %s\n", strerror(-r));
+        exit(1);
     }
     /* End Initialize */
 
@@ -38,7 +39,14 @@ static void *qemu_bhyve_cpu_thread_fn(void *arg) {
     // Deterministic mode seed
     qemu_guest_random_seed_thread_part2(cpu->random_seed);
 
-    /* vCPU Loop */
+    /* vCPU Loop — mirrors KVM pattern.
+     *
+     * qemu_process_cpu_events() is the key: when cpu->halted is true
+     * (set by the HLT exit handler), it blocks on cpu->halt_cond
+     * while releasing the BQL. This allows the main event loop thread
+     * to run QEMU timers (PIT fires → bhyve_pic_set_irq → IRQ0 →
+     * cpu_interrupt(CPU_INTERRUPT_HARD) → qemu_cpu_kick → wakes us).
+     */
     do {
         qemu_process_cpu_events(cpu);
         if (cpu_can_run(cpu)) {
