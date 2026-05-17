@@ -492,6 +492,7 @@ bool timerlist_run_timers(QEMUTimerList *timer_list)
     bool progress = false;
     QEMUTimerCB *cb;
     void *opaque;
+    static int trt_log = 0;
 
     if (!qatomic_read(&timer_list->active_timers)) {
         return false;
@@ -531,12 +532,11 @@ bool timerlist_run_timers(QEMUTimerList *timer_list)
      * done".
      */
     current_time = qemu_clock_get_ns(timer_list->clock->type);
+    /* Suppressed TRT-HLT noise */
     qemu_mutex_lock(&timer_list->active_timers_lock);
     while ((ts = timer_list->active_timers)) {
         if (!timer_expired_ns(ts, current_time)) {
-            /* No expired timers left.  The checkpoint can be skipped
-             * if no timers fired or they were all external.
-             */
+            /* Suppressed TRT NOT expired noise */
             break;
         }
         /* Checkpoint for virtual clock is redundant in cases where
@@ -687,4 +687,25 @@ int64_t qemu_clock_advance_virtual_time(int64_t dest)
     qemu_clock_notify(QEMU_CLOCK_VIRTUAL);
 
     return clock;
+}
+
+/* Debug helper for bhyve HLT handler */
+void bhyve_debug_dump_timerlists(QEMUClockType type)
+{
+    QEMUClock *clock = qemu_clock_ptr(type);
+    QEMUTimerList *tl;
+    int idx = 0;
+
+    fprintf(stderr, "  clock enabled=%d\n", clock->enabled);
+    QLIST_FOREACH(tl, &clock->timerlists, list) {
+        QEMUTimer *ts = qatomic_read(&tl->active_timers);
+        int is_main = (tl == main_loop_tlg.tl[type]);
+        fprintf(stderr, "  tl[%d]: active=%p is_main=%d\n",
+                idx, ts, is_main);
+        if (ts) {
+            fprintf(stderr, "    expire=%ld cb=%p\n",
+                    (long)ts->expire_time, ts->cb);
+        }
+        idx++;
+    }
 }
