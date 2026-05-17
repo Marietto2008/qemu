@@ -2360,6 +2360,16 @@ void ide_ctrl_write(void *opaque, uint32_t addr, uint32_t val)
 
     trace_ide_ctrl_write(addr, val, bus);
 
+    /* Debug: log control register writes that change nIEN */
+    {
+        static int ctrl_write_log = 0;
+        if (ctrl_write_log < 30) {
+            fprintf(stderr, "IDE_CTRL_WRITE: addr=0x%x val=0x%02x (nIEN=%d) old_cmd=0x%02x\n",
+                    addr, val, !!(val & IDE_CTRL_DISABLE_IRQ), bus->cmd);
+            ctrl_write_log++;
+        }
+    }
+
     /* Device0 and Device1 each have their own control register,
      * but QEMU models it as just one register in the controller. */
     if (!(bus->cmd & IDE_CTRL_RESET) && (val & IDE_CTRL_RESET)) {
@@ -2808,8 +2818,19 @@ void ide_bus_init_output_irq(IDEBus *bus, qemu_irq irq_out)
 
 void ide_bus_set_irq(IDEBus *bus)
 {
+    static int ide_irq_enabled_log = 0;
+    static int ide_irq_disabled_log = 0;
     if (!(bus->cmd & IDE_CTRL_DISABLE_IRQ)) {
+        if (ide_irq_enabled_log < 5) {
+            fprintf(stderr, "IDE_IRQ_FIRED: cmd=0x%02x → raising IRQ!\n", bus->cmd);
+            ide_irq_enabled_log++;
+        }
         qemu_irq_raise(bus->irq);
+    } else {
+        if (ide_irq_disabled_log < 5) {
+            fprintf(stderr, "IDE_IRQ_BLOCKED: cmd=0x%02x nIEN=1\n", bus->cmd);
+            ide_irq_disabled_log++;
+        }
     }
 }
 

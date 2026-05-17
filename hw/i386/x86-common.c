@@ -461,6 +461,15 @@ void gsi_handler(void *opaque, int n, int level)
     GSIState *s = opaque;
     bool bypass_ioapic = false;
 
+    /* Debug: log IRQ14/15 (IDE) */
+    if ((n == 14 || n == 15) && level) {
+        static int gsi_ide_log = 0;
+        if (gsi_ide_log < 20) {
+            fprintf(stderr, "GSI_HANDLER: IRQ%d level=%d\n", n, level);
+            gsi_ide_log++;
+        }
+    }
+
     trace_x86_gsi_interrupt(n, level);
 
 #ifdef CONFIG_XEN_EMU
