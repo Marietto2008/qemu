@@ -1,0 +1,2263 @@
+#include "qemu/osdep.h"
+#include "qemu/accel.h"
+#include "accel/accel-ops.h"
+#include "hw/core/boards.h"
+#include "qemu/typedefs.h"
+#include "system/runstate.h"
+#include "system/bhyve.h"
+#include "cpu.h"
+#include "system/address-spaces.h"
+#include "system/ioport.h"
+#include "qemu/main-loop.h"
+#include "qemu/timer.h"
+#include "qemu/aio.h"
+#include "qemu/error-report.h"
+#include "qapi/error.h"
+#include "system/memory.h"
+#include "strings.h"
+#include "qapi/qapi-types-common.h"
+#include "qapi/qapi-visit-common.h"
+
+#include "bhyve-accel-ops.h"
+#include "bhyve-internal.h"
+
+#include <signal.h>
+#include <unistd.h>
+#include <errno.h>
+
+#include <machine/specialreg.h>
+#include <string.h>
+#include <vmmapi.h>
+
+/* -------------------------------------------------------------------------- */
+
+/* MMIO emulation counters */
+static volatile long mmio_kernel_ok = 0;    /* decoded by kernel vie */
+static volatile long mmio_user_read = 0;    /* emulated reads in userspace */
+static volatile long mmio_user_write = 0;   /* emulated writes in userspace */
+static volatile long mmio_user_skip = 0;    /* unknown opcode, skipped */
+static volatile long mmio_last_gpa = 0;     /* last GPA accessed */
+static volatile long io_total = 0;          /* total I/O port exits */
+static volatile long vm_run_total = 0;      /* total vm_run calls */
+static volatile long exit_hlt = 0;
+static volatile long exit_bogus = 0;
+static volatile long exit_inout = 0;
+static volatile long exit_debug = 0;
+static volatile long exit_other = 0;
+static volatile long exit_pause = 0;
+
+/*
+ * LAPIC timer polling mechanism.
+ *
+ * Problem: The kernel's vlapic timer fires via callout and writes the
+ * interrupt vector into the vLAPIC IRR. It then calls vcpu_notify_event(),
+ * but when the vcpu has returned to userspace (VCPU_FROZEN state), that
+ * function does nothing — it only handles VCPU_RUNNING and VCPU_SLEEPING.
+ * So QEMU never learns that a LAPIC timer interrupt is pending in the IRR.
+ *
+ * Fix: When the guest HLTs, we start a 1ms one-shot timer. When it fires,
+ * it calls cpu_interrupt(HARD) which wakes the vcpu from halt_cond.
+ * The vcpu then re-enters vm_run, and the kernel's vmx_inject_interrupts
+ * finds the pending interrupt in IRR and injects it into the guest.
+ *
+ * If the guest HLTs again (no interrupt was pending), we restart the timer.
+ * Effective poll rate: ~1000 Hz, matching Linux's default LAPIC timer freq.
+ */
+static QEMUTimer *lapic_poll_timer;
+static CPUState *lapic_poll_cpu;
+
+static void lapic_poll_timer_cb(void *opaque)
+{
+    CPUState *cpu = (CPUState *)opaque;
+    if (cpu && cpu->halted) {
+        cpu_interrupt(cpu, CPU_INTERRUPT_HARD);
+    }
+}
+
+static void mmio_print_stats(void) {
+    fprintf(stderr, "\n=== MMIO/IO Statistics ===\n"
+            "  vm_run calls:    %ld\n"
+            "  I/O port exits:  %ld\n"
+            "  MMIO kernel ok:  %ld\n"
+            "  MMIO user read:  %ld\n"
+            "  MMIO user write: %ld\n"
+            "  MMIO user skip:  %ld\n"
+            "  Last MMIO GPA:   0x%lx\n"
+            "  --- Exit codes ---\n"
+            "  HLT:    %ld\n"
+            "  BOGUS:  %ld\n"
+            "  INOUT:  %ld\n"
+            "  DEBUG:  %ld\n"
+            "  PAUSE:  %ld\n"
+            "  OTHER:  %ld\n"
+            "  --- IRQ counters (8259) ---\n"
+            "  IRQ0 assert:   %ld\n"
+            "  IRQ0 deassert: %ld\n"
+            "  Other IRQ:     %ld\n"
+            "========================\n",
+            vm_run_total, io_total,
+            mmio_kernel_ok, mmio_user_read,
+            mmio_user_write, mmio_user_skip,
+            mmio_last_gpa,
+            exit_hlt, exit_bogus, exit_inout,
+            exit_debug, exit_pause, exit_other,
+            pic_irq0_assert, pic_irq0_deassert,
+            pic_other_irq);
+    fflush(stderr);
+}
+
+#define VM_NAME "vm1"
+
+/* From machine/vmm.h - interrupt injection info */
+#ifndef VM_INTINFO_VALID
+#define VM_INTINFO_VALID    0x80000000
+#define VM_INTINFO_HWINTR   (0 << 8)
+#endif
+
+struct AccelCPUState {
+    struct vcpu *vcpu;
+    uint64_t tpr;
+
+    /* QEMU State =/= VMM state */
+    bool dirty;
+};
+
+/* -------------------------------------------------------------------------- */
+
+static bool bhyve_allowed;
+
+int
+bhyve_enabled(void) {
+    return bhyve_allowed;
+}
+
+static enum host_vendor get_cpu_vendor(void) {
+    unsigned int eax = 0;
+    unsigned int regs[4];
+    char vendor[13];
+
+    __asm__ __volatile__("cpuid"
+                         : "=a"(regs[0]), "=b"(regs[1]), "=c"(regs[2]),
+                           "=d"(regs[3])
+                         : "a"(eax)
+    );
+
+    *(unsigned int *)(vendor + 0) = regs[0]; /* EBX */
+    *(unsigned int *)(vendor + 4) = regs[2]; /* EDX */
+    *(unsigned int *)(vendor + 8) = regs[1]; /* ECX */
+    vendor[12] = '\0';
+
+    if (strstr(vendor, "Intel")) {
+        return VENDOR_INTEL;
+    } else if (strstr(vendor, "AMD")) {
+        return VENDOR_AMD;
+    } else {
+        return VENDOR_UNKNOWN;
+    }
+}
+
+/* -------------------------------------------------------------------------- */
+
+struct bhyve_machine bhyve_mach;
+
+/* -------------------------------------------------------------------------- */
+
+struct vcpu *bhyve_get_vcpu(CPUState *cpu) {
+    return cpu->accel->vcpu;
+}
+
+static struct bhyve_machine *get_bhyve_mach(void) {
+    return &bhyve_mach;
+}
+
+static void dump_registers(struct vcpu *vcpu) {
+    uint64_t val;
+    int err;
+
+    printf("\n=== Register Dump ===\n");
+
+    const struct {
+        const char *name;
+        int reg;
+    } regs[] = {
+        { "RAX", VM_REG_GUEST_RAX },
+        { "RBX", VM_REG_GUEST_RBX },
+        { "RCX", VM_REG_GUEST_RCX },
+        { "RDX", VM_REG_GUEST_RDX },
+        { "RSI", VM_REG_GUEST_RSI },
+        { "RDI", VM_REG_GUEST_RDI },
+        { "RBP", VM_REG_GUEST_RBP },
+        { "RSP", VM_REG_GUEST_RSP },
+        { "RIP", VM_REG_GUEST_RIP },
+        { "RFLAGS", VM_REG_GUEST_RFLAGS },
+    };
+
+    for (int i = 0; i < sizeof(regs)/sizeof(regs[0]); i++) {
+        err = vm_get_register(vcpu, regs[i].reg, &val);
+        if (err != 0) {
+            printf("%s: ERROR (%d)\n", regs[i].name, err);
+        } else {
+            printf("%-8s = 0x%016" PRIx64 "\n", regs[i].name, val);
+        }
+    }
+
+    const struct {
+        const char *name;
+        int reg;
+    } segs[] = {
+        { "CS", VM_REG_GUEST_CS },
+        { "DS", VM_REG_GUEST_DS },
+        { "ES", VM_REG_GUEST_ES },
+        { "SS", VM_REG_GUEST_SS },
+        { "FS", VM_REG_GUEST_FS },
+        { "GS", VM_REG_GUEST_GS },
+    };
+
+    struct seg_desc desc;
+    for (int i = 0; i < sizeof(segs)/sizeof(segs[0]); i++) {
+        err = vm_get_seg_desc(vcpu, segs[i].reg, &desc);
+        if (err != 0) {
+            printf("%s: ERROR (%d)\n", segs[i].name, err);
+        } else {
+            printf("%s: base=0x%016" PRIx64 " limit=0x%08x access=0x%08x\n",
+                segs[i].name, desc.base, desc.limit, desc.access);
+        }
+    }
+
+    printf("======================\n\n");
+}
+
+/* -------------------------------------------------------------------------- */
+
+/*
+static int
+vmm_set_segment(struct vcpu *vcpu, int reg, const SegmentCache *qseg)
+{
+    int error;
+    error = vm_set_register(vcpu, reg, qseg->selector);
+    if (error) {
+        return -1;
+    }
+
+    error = vm_set_desc(vcpu, reg, qseg->base, qseg->limit, qseg->flags);
+    if (error) {
+        return -1;
+    }
+    return 0;
+}
+
+static int
+vmm_get_segment(struct vcpu *vcpu, int reg, const SegmentCache *qseg)
+{
+    int error;
+    error = vm_get_register(vcpu, reg, (const uint64_t*)&qseg->flags);
+    if (error) {
+        return error;
+    }
+    error = vm_get_desc(vcpu, reg, (const unsigned long*)&qseg->base, &qseg->limit, (const unsigned int*)&qseg->flags);
+    if (error) {
+        return error;
+    }
+    return 0;
+}
+*/
+
+static int vmm_set_registers(CPUState *cpu) {
+    CPUX86State *env = cpu_env(cpu);
+    AccelCPUState *qcpu = cpu->accel;
+    struct vcpu* vcpu = qcpu->vcpu;
+
+    /* GPRs */
+    int ret;
+
+    // General-Purpose Registers
+    ret = vm_set_register(vcpu, VM_REG_GUEST_RAX, env->regs[R_EAX]);
+    if (ret != 0) return ret;
+    ret = vm_set_register(vcpu, VM_REG_GUEST_RBX, env->regs[R_EBX]);
+    if (ret != 0) return ret;
+    ret = vm_set_register(vcpu, VM_REG_GUEST_RCX, env->regs[R_ECX]);
+    if (ret != 0) return ret;
+    ret = vm_set_register(vcpu, VM_REG_GUEST_RDX, env->regs[R_EDX]);
+    if (ret != 0) return ret;
+    ret = vm_set_register(vcpu, VM_REG_GUEST_RSI, env->regs[R_ESI]);
+    if (ret != 0) return ret;
+    ret = vm_set_register(vcpu, VM_REG_GUEST_RDI, env->regs[R_EDI]);
+    if (ret != 0) return ret;
+    ret = vm_set_register(vcpu, VM_REG_GUEST_RBP, env->regs[R_EBP]);
+    if (ret != 0) return ret;
+    ret = vm_set_register(vcpu, VM_REG_GUEST_RSP, env->regs[R_ESP]);
+    if (ret != 0) return ret;
+#ifdef TARGET_X86_64
+    ret = vm_set_register(vcpu, VM_REG_GUEST_R8, env->regs[R_R8]);
+    if (ret != 0) return ret;
+    ret = vm_set_register(vcpu, VM_REG_GUEST_R9, env->regs[R_R9]);
+    if (ret != 0) return ret;
+    ret = vm_set_register(vcpu, VM_REG_GUEST_R10, env->regs[R_R10]);
+    if (ret != 0) return ret;
+    ret = vm_set_register(vcpu, VM_REG_GUEST_R11, env->regs[R_R11]);
+    if (ret != 0) return ret;
+    ret = vm_set_register(vcpu, VM_REG_GUEST_R12, env->regs[R_R12]);
+    if (ret != 0) return ret;
+    ret = vm_set_register(vcpu, VM_REG_GUEST_R13, env->regs[R_R13]);
+    if (ret != 0) return ret;
+    ret = vm_set_register(vcpu, VM_REG_GUEST_R14, env->regs[R_R14]);
+    if (ret != 0) return ret;
+    ret = vm_set_register(vcpu, VM_REG_GUEST_R15, env->regs[R_R15]);
+    if (ret != 0) return ret;
+#endif
+
+    // RIP and RFLAGS
+    ret = vm_set_register(vcpu, VM_REG_GUEST_RIP, env->eip);
+    if (ret != 0) return ret;
+    ret = vm_set_register(vcpu, VM_REG_GUEST_RFLAGS, env->eflags);
+    if (ret != 0) return ret;
+
+    /*
+     * Segment Registers — full descriptors (selector + base + limit + access).
+     * VMX requires complete segment state in VMCS, not just selectors.
+     *
+     * QEMU flags layout (bits of GDT descriptor second dword):
+     *   TYPE[11:8] S[12] DPL[14:13] P[15] L[21] DB[22] G[23]
+     * VMX access rights layout:
+     *   TYPE[3:0] S[4] DPL[6:5] P[7] reserved[11:8] L[13] DB[14] G[15] Unusable[16]
+     *
+     * Conversion: shift QEMU flags right by 8, mask relevant bits,
+     * then handle L/DB/G which are at different positions.
+     */
+#define QEMU_FLAGS_TO_VMX_AR(flags) ({                               \
+    uint32_t _f = (flags);                                           \
+    uint32_t _lo = (_f >> 8) & 0xFF;   /* TYPE,S,DPL,P */           \
+    uint32_t _l  = (_f >> 21) & 1;     /* L bit */                  \
+    uint32_t _db = (_f >> 22) & 1;     /* D/B bit */                \
+    uint32_t _g  = (_f >> 23) & 1;     /* G bit */                  \
+    uint32_t _ar = _lo | (_l << 13) | (_db << 14) | (_g << 15);    \
+    /* If P=0, mark segment unusable */                              \
+    if (!(_ar & 0x80)) _ar |= (1 << 16);                            \
+    _ar;                                                             \
+})
+
+    {
+        struct { int reg; int qemu_idx; } segs[] = {
+            { VM_REG_GUEST_CS, R_CS },
+            { VM_REG_GUEST_DS, R_DS },
+            { VM_REG_GUEST_ES, R_ES },
+            { VM_REG_GUEST_SS, R_SS },
+            { VM_REG_GUEST_FS, R_FS },
+            { VM_REG_GUEST_GS, R_GS },
+        };
+        for (int i = 0; i < 6; i++) {
+            uint32_t vmx_ar = QEMU_FLAGS_TO_VMX_AR(env->segs[segs[i].qemu_idx].flags);
+            ret = vm_set_register(vcpu, segs[i].reg,
+                                  env->segs[segs[i].qemu_idx].selector);
+            if (ret != 0) return ret;
+            ret = vm_set_desc(vcpu, segs[i].reg,
+                              env->segs[segs[i].qemu_idx].base,
+                              env->segs[segs[i].qemu_idx].limit,
+                              vmx_ar);
+            if (ret != 0) return ret;
+        }
+    }
+    // LDTR
+    {
+        uint32_t vmx_ar = QEMU_FLAGS_TO_VMX_AR(env->ldt.flags);
+        ret = vm_set_register(vcpu, VM_REG_GUEST_LDTR, env->ldt.selector);
+        if (ret != 0) return ret;
+        ret = vm_set_desc(vcpu, VM_REG_GUEST_LDTR,
+                          env->ldt.base, env->ldt.limit, vmx_ar);
+        if (ret != 0) return ret;
+    }
+    // TR — must not be unusable, force P=1
+    {
+        uint32_t vmx_ar = QEMU_FLAGS_TO_VMX_AR(env->tr.flags);
+        vmx_ar &= ~(1 << 16); /* TR must never be unusable */
+        if (!(vmx_ar & 0x80)) vmx_ar |= 0x80; /* force P=1 */
+        if (!(vmx_ar & 0x0F)) vmx_ar |= 0x0B; /* force type=busy 32-bit TSS */
+        ret = vm_set_register(vcpu, VM_REG_GUEST_TR, env->tr.selector);
+        if (ret != 0) return ret;
+        ret = vm_set_desc(vcpu, VM_REG_GUEST_TR,
+                          env->tr.base,
+                          env->tr.limit >= 0x67 ? env->tr.limit : 0x67,
+                          vmx_ar);
+        if (ret != 0) return ret;
+    }
+#undef QEMU_FLAGS_TO_VMX_AR
+
+    // Descriptor Table Registers (Base AND Limit via vm_set_desc)
+    ret = vm_set_desc(vcpu, VM_REG_GUEST_GDTR, env->gdt.base, env->gdt.limit, 0);
+    if (ret != 0) return ret;
+    ret = vm_set_desc(vcpu, VM_REG_GUEST_IDTR, env->idt.base, env->idt.limit, 0);
+    if (ret != 0) return ret;
+
+    // Control Registers
+    ret = vm_set_register(vcpu, VM_REG_GUEST_CR0, env->cr[0]);
+    if (ret != 0) return ret;
+    ret = vm_set_register(vcpu, VM_REG_GUEST_CR2, env->cr[2]);
+    if (ret != 0) return ret;
+    ret = vm_set_register(vcpu, VM_REG_GUEST_CR3, env->cr[3]);
+    if (ret != 0) return ret;
+    ret = vm_set_register(vcpu, VM_REG_GUEST_CR4, env->cr[4]);
+    if (ret != 0) return ret;
+    ret = vm_set_register(vcpu, VM_REG_GUEST_TPR, qcpu->tpr);
+    if (ret != 0) return ret;
+
+    // Debug Registers
+    ret = vm_set_register(vcpu, VM_REG_GUEST_DR0, env->dr[0]);
+    if (ret != 0) return ret;
+    ret = vm_set_register(vcpu, VM_REG_GUEST_DR1, env->dr[1]);
+    if (ret != 0) return ret;
+    ret = vm_set_register(vcpu, VM_REG_GUEST_DR2, env->dr[2]);
+    if (ret != 0) return ret;
+    ret = vm_set_register(vcpu, VM_REG_GUEST_DR3, env->dr[3]);
+    if (ret != 0) return ret;
+    ret = vm_set_register(vcpu, VM_REG_GUEST_DR6, env->dr[6]);
+    if (ret != 0) return ret;
+    ret = vm_set_register(vcpu, VM_REG_GUEST_DR7, env->dr[7]);
+    if (ret != 0) return ret;
+
+    // MSRs
+    ret = vm_set_register(vcpu, VM_REG_GUEST_EFER, env->efer);
+    if (ret != 0) return ret;
+#ifdef TARGET_X86_64
+    ret = vm_set_register(vcpu, VM_REG_GUEST_FS_BASE, env->segs[R_FS].base);
+    if (ret != 0) return ret;
+    ret = vm_set_register(vcpu, VM_REG_GUEST_GS_BASE, env->segs[R_GS].base);
+    if (ret != 0) return ret;
+    ret = vm_set_register(vcpu, VM_REG_GUEST_KGS_BASE, env->kernelgsbase);
+    if (ret != 0) return ret;
+#endif
+
+    return 0; // Success
+}
+
+static int vmm_get_registers(CPUState *cpu) {
+    CPUX86State *env = cpu_env(cpu);
+    AccelCPUState *qcpu = cpu->accel;
+    struct vcpu *vcpu = qcpu->vcpu;
+    uint64_t val;
+    int ret;
+
+    // General-Purpose Registers
+    ret = vm_get_register(vcpu, VM_REG_GUEST_RAX, &val);
+    if (ret != 0) return ret;
+    env->regs[R_EAX] = val;
+
+    ret = vm_get_register(vcpu, VM_REG_GUEST_RBX, &val);
+    if (ret != 0) return ret;
+    env->regs[R_EBX] = val;
+
+    ret = vm_get_register(vcpu, VM_REG_GUEST_RCX, &val);
+    if (ret != 0) return ret;
+    env->regs[R_ECX] = val;
+
+    ret = vm_get_register(vcpu, VM_REG_GUEST_RDX, &val);
+    if (ret != 0) return ret;
+    env->regs[R_EDX] = val;
+
+    ret = vm_get_register(vcpu, VM_REG_GUEST_RSI, &val);
+    if (ret != 0) return ret;
+    env->regs[R_ESI] = val;
+
+    ret = vm_get_register(vcpu, VM_REG_GUEST_RDI, &val);
+    if (ret != 0) return ret;
+    env->regs[R_EDI] = val;
+
+    ret = vm_get_register(vcpu, VM_REG_GUEST_RBP, &val);
+    if (ret != 0) return ret;
+    env->regs[R_EBP] = val;
+
+    ret = vm_get_register(vcpu, VM_REG_GUEST_RSP, &val);
+    if (ret != 0) return ret;
+    env->regs[R_ESP] = val;
+
+#ifdef TARGET_X86_64
+    ret = vm_get_register(vcpu, VM_REG_GUEST_R8, &val);
+    if (ret != 0) return ret;
+    env->regs[R_R8] = val;
+
+    ret = vm_get_register(vcpu, VM_REG_GUEST_R9, &val);
+    if (ret != 0) return ret;
+    env->regs[R_R9] = val;
+
+    ret = vm_get_register(vcpu, VM_REG_GUEST_R10, &val);
+    if (ret != 0) return ret;
+    env->regs[R_R10] = val;
+
+    ret = vm_get_register(vcpu, VM_REG_GUEST_R11, &val);
+    if (ret != 0) return ret;
+    env->regs[R_R11] = val;
+
+    ret = vm_get_register(vcpu, VM_REG_GUEST_R12, &val);
+    if (ret != 0) return ret;
+    env->regs[R_R12] = val;
+
+    ret = vm_get_register(vcpu, VM_REG_GUEST_R13, &val);
+    if (ret != 0) return ret;
+    env->regs[R_R13] = val;
+
+    ret = vm_get_register(vcpu, VM_REG_GUEST_R14, &val);
+    if (ret != 0) return ret;
+    env->regs[R_R14] = val;
+
+    ret = vm_get_register(vcpu, VM_REG_GUEST_R15, &val);
+    if (ret != 0) return ret;
+    env->regs[R_R15] = val;
+#endif
+
+    // RIP and RFLAGS
+    ret = vm_get_register(vcpu, VM_REG_GUEST_RIP, &val);
+    if (ret != 0) return ret;
+    env->eip = val;
+
+    ret = vm_get_register(vcpu, VM_REG_GUEST_RFLAGS, &val);
+    if (ret != 0) return ret;
+    env->eflags = val;
+
+    /*
+     * Segment Registers — full descriptors (selector + base + limit + flags).
+     * Convert VMX access rights back to QEMU flags format.
+     * VMX AR: TYPE[3:0] S[4] DPL[6:5] P[7] L[13] DB[14] G[15]
+     * QEMU flags: TYPE[11:8] S[12] DPL[14:13] P[15] L[21] DB[22] G[23]
+     */
+#define VMX_AR_TO_QEMU_FLAGS(ar) ({                                  \
+    uint32_t _a = (ar);                                              \
+    uint32_t _lo = (_a & 0xFF) << 8; /* TYPE,S,DPL,P -> bits 8-15 */\
+    uint32_t _l  = ((_a >> 13) & 1) << 21;                          \
+    uint32_t _db = ((_a >> 14) & 1) << 22;                          \
+    uint32_t _g  = ((_a >> 15) & 1) << 23;                          \
+    _lo | _l | _db | _g;                                             \
+})
+    {
+        struct { int reg; int qemu_idx; } segs[] = {
+            { VM_REG_GUEST_CS, R_CS },
+            { VM_REG_GUEST_DS, R_DS },
+            { VM_REG_GUEST_ES, R_ES },
+            { VM_REG_GUEST_SS, R_SS },
+            { VM_REG_GUEST_FS, R_FS },
+            { VM_REG_GUEST_GS, R_GS },
+        };
+        for (int i = 0; i < 6; i++) {
+            uint64_t base;
+            uint32_t limit, access;
+            ret = vm_get_register(vcpu, segs[i].reg, &val);
+            if (ret != 0) return ret;
+            env->segs[segs[i].qemu_idx].selector = (uint16_t)val;
+            ret = vm_get_desc(vcpu, segs[i].reg, &base, &limit, &access);
+            if (ret != 0) return ret;
+            env->segs[segs[i].qemu_idx].base = base;
+            env->segs[segs[i].qemu_idx].limit = limit;
+            env->segs[segs[i].qemu_idx].flags = VMX_AR_TO_QEMU_FLAGS(access);
+        }
+    }
+    // LDTR
+    {
+        uint64_t base;
+        uint32_t limit, access;
+        ret = vm_get_register(vcpu, VM_REG_GUEST_LDTR, &val);
+        if (ret != 0) return ret;
+        env->ldt.selector = (uint16_t)val;
+        ret = vm_get_desc(vcpu, VM_REG_GUEST_LDTR, &base, &limit, &access);
+        if (ret != 0) return ret;
+        env->ldt.base = base;
+        env->ldt.limit = limit;
+        env->ldt.flags = VMX_AR_TO_QEMU_FLAGS(access);
+    }
+    // TR
+    {
+        uint64_t base;
+        uint32_t limit, access;
+        ret = vm_get_register(vcpu, VM_REG_GUEST_TR, &val);
+        if (ret != 0) return ret;
+        env->tr.selector = (uint16_t)val;
+        ret = vm_get_desc(vcpu, VM_REG_GUEST_TR, &base, &limit, &access);
+        if (ret != 0) return ret;
+        env->tr.base = base;
+        env->tr.limit = limit;
+        env->tr.flags = VMX_AR_TO_QEMU_FLAGS(access);
+    }
+    // GDTR / IDTR (base + limit)
+    {
+        uint64_t base;
+        uint32_t limit, dummy;
+        ret = vm_get_desc(vcpu, VM_REG_GUEST_GDTR, &base, &limit, &dummy);
+        if (ret != 0) return ret;
+        env->gdt.base = base;
+        env->gdt.limit = limit;
+        ret = vm_get_desc(vcpu, VM_REG_GUEST_IDTR, &base, &limit, &dummy);
+        if (ret != 0) return ret;
+        env->idt.base = base;
+        env->idt.limit = limit;
+    }
+#undef VMX_AR_TO_QEMU_FLAGS
+
+    // Control Registers
+    ret = vm_get_register(vcpu, VM_REG_GUEST_CR0, &val);
+    if (ret != 0) return ret;
+    env->cr[0] = val;
+
+    ret = vm_get_register(vcpu, VM_REG_GUEST_CR2, &val);
+    if (ret != 0) return ret;
+    env->cr[2] = val;
+
+    ret = vm_get_register(vcpu, VM_REG_GUEST_CR3, &val);
+    if (ret != 0) return ret;
+    env->cr[3] = val;
+
+    ret = vm_get_register(vcpu, VM_REG_GUEST_CR4, &val);
+    if (ret != 0) return ret;
+    env->cr[4] = val;
+
+    ret = vm_get_register(vcpu, VM_REG_GUEST_TPR, &val);
+    if (ret != 0) return ret;
+    qcpu->tpr = val;
+
+    // Debug Registers
+    ret = vm_get_register(vcpu, VM_REG_GUEST_DR0, &val);
+    if (ret != 0) return ret;
+    env->dr[0] = val;
+
+    ret = vm_get_register(vcpu, VM_REG_GUEST_DR1, &val);
+    if (ret != 0) return ret;
+    env->dr[1] = val;
+
+    ret = vm_get_register(vcpu, VM_REG_GUEST_DR2, &val);
+    if (ret != 0) return ret;
+    env->dr[2] = val;
+
+    ret = vm_get_register(vcpu, VM_REG_GUEST_DR3, &val);
+    if (ret != 0) return ret;
+    env->dr[3] = val;
+
+    ret = vm_get_register(vcpu, VM_REG_GUEST_DR6, &val);
+    if (ret != 0) return ret;
+    env->dr[6] = val;
+
+    ret = vm_get_register(vcpu, VM_REG_GUEST_DR7, &val);
+    if (ret != 0) return ret;
+    env->dr[7] = val;
+
+    // MSRs
+    ret = vm_get_register(vcpu, VM_REG_GUEST_EFER, &val);
+    if (ret != 0) return ret;
+    env->efer = val;
+
+#ifdef TARGET_X86_64
+    ret = vm_get_register(vcpu, VM_REG_GUEST_FS_BASE, &val);
+    if (ret != 0) return ret;
+    env->segs[R_FS].base = val;
+
+    ret = vm_get_register(vcpu, VM_REG_GUEST_GS_BASE, &val);
+    if (ret != 0) return ret;
+    env->segs[R_GS].base = val;
+
+    ret = vm_get_register(vcpu, VM_REG_GUEST_KGS_BASE, &val);
+    if (ret != 0) return ret;
+    env->kernelgsbase = val;
+#endif
+
+    return 0; // Success
+}
+
+/* -------------------------------------------------------------------------- */
+
+static int
+vmm_io_callback(struct vm_qio *io)
+{
+    MemTxAttrs attrs = { 0 };
+    int ret;
+
+    io_total++;
+    ret = address_space_rw(&address_space_io, io->port, attrs, io->data,
+        io->size, !io->in);
+    if (ret != MEMTX_OK) {
+        error_report("Bhyve: I/O Transaction Failed "
+            "[%s, port=%u, size=%zu]", (io->in ? "in" : "out"),
+            io->port, io->size);
+    }
+
+    /* Log IDE I/O after kernel takes over (skip first 5000 total IOs = SeaBIOS) */
+    {
+        static long io_count = 0;
+        static int ide_log = 0;
+        uint16_t port = io->port;
+        io_count++;
+        if (io_count > 5000 && ide_log < 100) {
+            if ((port >= 0x1f0 && port <= 0x1f7) ||
+                (port >= 0x170 && port <= 0x177) ||
+                port == 0x3f6 || port == 0x376) {
+                fprintf(stderr, "IDE[%ld]: %s port=0x%04x size=%zu data=0x",
+                        io_count, io->in ? "IN " : "OUT", port, io->size);
+                for (int j = (int)io->size - 1; j >= 0; j--)
+                    fprintf(stderr, "%02x", io->data[j]);
+                fprintf(stderr, "\n");
+                ide_log++;
+            }
+        }
+    }
+
+    current_cpu->accel->dirty = false;
+    return 0;
+}
+
+static int
+vmm_mem_callback(struct vm_qmem *mem)
+{
+
+    address_space_rw(&address_space_memory, mem->gpa, MEMTXATTRS_UNSPECIFIED,
+                     mem->data, mem->size, mem->write);
+
+    current_cpu->accel->dirty = false;
+    return 0;
+}
+
+/* Directly copy from Bhyve */
+static int bhyve_intel_rdmsr(uint32_t num, uint64_t* val) {
+    int error = 0;
+    switch (num) {
+    case MSR_BIOS_SIGN:
+    case MSR_IA32_PLATFORM_ID:
+    case MSR_PKG_ENERGY_STATUS:
+    case MSR_PP0_ENERGY_STATUS:
+    case MSR_PP1_ENERGY_STATUS:
+    case MSR_DRAM_ENERGY_STATUS:
+    case MSR_MISC_FEATURE_ENABLES:
+        *val = 0;
+        break;
+    case MSR_RAPL_POWER_UNIT:
+        /*
+            * Use the default value documented in section
+            * "RAPL Interfaces" in Intel SDM vol3.
+            */
+        *val = 0x000a1003;
+        break;
+    case MSR_IA32_FEATURE_CONTROL:
+        /*
+            * Windows guests check this MSR.
+            * Set the lock bit to avoid writes
+            * to this MSR.
+            */
+        *val = IA32_FEATURE_CONTROL_LOCK;
+        break;
+    default:
+        *val = 0;
+        error = 0;
+        break;
+    }
+    return error;
+}
+
+static int bhyve_amd_rdmsr(uint32_t num, uint64_t* val) {
+    int error = 0;
+    switch (num) {
+    case MSR_BIOS_SIGN:
+        *val = 0;
+        break;
+    case MSR_HWCR:
+        /*
+            * Bios and Kernel Developer's Guides for AMD Families
+            * 12H, 14H, 15H and 16H.
+            */
+        *val = 0x01000010;	/* Reset value */
+        *val |= 1 << 9;		/* MONITOR/MWAIT disable */
+        break;
+
+    case MSR_NB_CFG1:
+    case MSR_LS_CFG:
+    case MSR_IC_CFG:
+        /*
+            * The reset value is processor family dependent so
+            * just return 0.
+            */
+        *val = 0;
+        break;
+
+    case MSR_PERFEVSEL0:
+    case MSR_PERFEVSEL1:
+    case MSR_PERFEVSEL2:
+    case MSR_PERFEVSEL3:
+        /*
+            * PerfEvtSel MSRs are not properly virtualized so just
+            * return zero.
+            */
+        *val = 0;
+        break;
+
+    case MSR_K7_PERFCTR0:
+    case MSR_K7_PERFCTR1:
+    case MSR_K7_PERFCTR2:
+    case MSR_K7_PERFCTR3:
+        /*
+            * PerfCtr MSRs are not properly virtualized so just
+            * return zero.
+            */
+        *val = 0;
+        break;
+
+    case MSR_SMM_ADDR:
+    case MSR_SMM_MASK:
+        /*
+            * Return the reset value defined in the AMD Bios and
+            * Kernel Developer's Guide.
+            */
+        *val = 0;
+        break;
+
+    case MSR_P_STATE_LIMIT:
+    case MSR_P_STATE_CONTROL:
+    case MSR_P_STATE_STATUS:
+    case MSR_P_STATE_CONFIG(0):	/* P0 configuration */
+        *val = 0;
+        break;
+
+    /*
+        * OpenBSD guests test bit 0 of this MSR to detect if the
+        * workaround for erratum 721 is already applied.
+        * https://support.amd.com/TechDocs/41322_10h_Rev_Gd.pdf
+        */
+    case 0xC0011029:
+        *val = 1;
+        break;
+
+    default:
+        *val = 0;
+        error = 0;
+        break;
+    }
+    return error;
+}
+
+/* rdmsr & wrmsr */
+static int bhyve_rdmsr(struct vcpu* vcpu, struct vm_exit *vme) {
+    struct bhyve_machine* mach = get_bhyve_mach();
+    int error;
+    uint32_t num = vme->u.msr.code;
+    uint64_t val = 0;
+
+    switch (mach->cpu_vendor) {
+    case VENDOR_INTEL:
+        error = bhyve_intel_rdmsr(num, &val);
+        goto finish;
+    case VENDOR_AMD:
+        error = bhyve_amd_rdmsr(num, &val);
+        goto finish;
+    case VENDOR_UNKNOWN:
+        /* Early boot: vendor not yet detected, return 0 */
+        goto finish;
+    }
+
+finish:
+    error = vm_set_register(vcpu, VM_REG_GUEST_RAX, val);
+    error = vm_set_register(vcpu, VM_REG_GUEST_RDX, val >> 32);
+
+    return error;
+}
+
+static int bhyve_intel_wrmsr(uint32_t num) {
+    switch (num) {
+    case 0xd04:		/* Sandy Bridge uncore PMCs */
+    case 0xc24:
+        return (0);
+    case MSR_BIOS_UPDT_TRIG:
+        return (0);
+    case MSR_BIOS_SIGN:
+        return (0);
+    default:
+        break;
+    }
+    return 0;
+}
+
+static int bhyve_amd_wrmsr(uint32_t num) {
+    switch (num) {
+    case MSR_HWCR:
+        /*
+            * Ignore writes to hardware configuration MSR.
+            */
+        return (0);
+
+    case MSR_NB_CFG1:
+    case MSR_LS_CFG:
+    case MSR_IC_CFG:
+        return (0);	/* Ignore writes */
+
+    case MSR_PERFEVSEL0:
+    case MSR_PERFEVSEL1:
+    case MSR_PERFEVSEL2:
+    case MSR_PERFEVSEL3:
+        /* Ignore writes to the PerfEvtSel MSRs */
+        return (0);
+
+    case MSR_K7_PERFCTR0:
+    case MSR_K7_PERFCTR1:
+    case MSR_K7_PERFCTR2:
+    case MSR_K7_PERFCTR3:
+        /* Ignore writes to the PerfCtr MSRs */
+        return (0);
+
+    case MSR_P_STATE_CONTROL:
+        /* Ignore write to change the P-state */
+        return (0);
+
+    default:
+        break;
+    }
+    return 0;
+}
+
+static int bhyve_wrmsr(struct vm_exit *vme) {
+    struct bhyve_machine* mach = get_bhyve_mach();
+    int error;
+    uint32_t num = vme->u.msr.code;
+    switch (mach->cpu_vendor) {
+    case VENDOR_INTEL:
+        error = bhyve_intel_wrmsr(num);
+        return error;
+    case VENDOR_AMD:
+        error = bhyve_amd_wrmsr(num);
+        return error;
+    case VENDOR_UNKNOWN:
+        return 0;
+    }
+
+    return 0;
+}
+
+/* -------------------------------------------------------------------------- */
+
+static void bhyve_vcpu_pre_run(CPUState *cpu) {
+    AccelCPUState *qcpu = cpu->accel;
+    struct vcpu *vcpu = qcpu->vcpu;
+    X86CPU *x86_cpu = X86_CPU(cpu);
+    uint8_t tpr;
+    bool sync_tpr = false;
+    int ret;
+
+    bql_lock();
+
+    /* Suppressed PRE_RUN noise */
+
+    // TPR is always synced (check bhyve-apic)
+    tpr = cpu_get_apic_tpr(x86_cpu->apic_state);
+    if (tpr != qcpu->tpr) {
+        qcpu->tpr = tpr;
+        sync_tpr = true;
+    }
+
+    /*
+     * Force the VCPU out of its inner loop to process any INIT requests
+     * or commit pending TPR access.
+     */
+    if (cpu->interrupt_request & (CPU_INTERRUPT_INIT | CPU_INTERRUPT_TPR)) {
+        cpu->exit_request = 1;
+    }
+
+    /* Handle NMIs (vmm takes care of nmi windows and interrupt shadows) */
+    if (cpu->interrupt_request & CPU_INTERRUPT_NMI) {
+        cpu->interrupt_request &= ~CPU_INTERRUPT_NMI;
+        printf("Hung here\n");
+        vm_inject_nmi(vcpu);
+    }
+
+    /* Don't want SMIs. */
+    if (cpu->interrupt_request & CPU_INTERRUPT_SMI) {
+        cpu->interrupt_request &= ~CPU_INTERRUPT_SMI;
+    }
+
+    /*
+     * Handle pending hardware interrupts.
+     *
+     * With bhyve's in-kernel PIC (vatpic), interrupt injection is done
+     * by the kernel's vmx_inject_interrupts() on vm_run entry. The
+     * CPU_INTERRUPT_HARD flag here is just used to prevent the vcpu
+     * from being halted in the main loop. Clear it and let the kernel
+     * handle actual injection — it will check extint_pending and
+     * vatpic_pending_intr on the next vmentry.
+     */
+    if (cpu->interrupt_request & CPU_INTERRUPT_HARD) {
+        cpu_reset_interrupt(cpu, CPU_INTERRUPT_HARD);
+
+        /*
+         * Inject pending interrupts into the vLAPIC.
+         *
+         * bhyve's kernel vatpic/vioapic do NOT auto-inject into
+         * the vLAPIC — vmx_inject_interrupts doesn't pick them up.
+         * We must inject from userspace via vm_lapic_irq().
+         *
+         * Read the pending IRQ bitmask (set by bhyve_pic_set_irq),
+         * find the highest-priority pending IRQ (lowest number),
+         * and look up the correct vector from the kernel's IOAPIC
+         * redirection table. The IOAPIC vector is what the guest
+         * expects (e.g., 0x30 for timer, not PIC's 0x20).
+         */
+        uint32_t pending = __atomic_exchange_n(
+            &bhyve_pic_pending_irqs, 0, __ATOMIC_ACQ_REL);
+        if (pending) {
+            int irq = __builtin_ctz(pending);  /* lowest set bit = highest priority */
+
+            /*
+             * Map ISA IRQ to IOAPIC pin: IRQ0→pin2, others→same pin#.
+             * Use QEMU's IOAPIC vector table (populated when guest
+             * programs IOAPIC RTEs via MMIO). Fall back to PIC vectors
+             * only if the guest hasn't programmed the IOAPIC yet.
+             */
+            int pin = (irq == 0) ? 2 : irq;
+            int vector = 0;
+
+            /* Use QEMU's own IOAPIC RTE vector (set by guest MMIO writes) */
+            if (pin < 24) {
+                uint8_t qemu_vec = bhyve_ioapic_vectors[pin];
+                if (qemu_vec >= 0x10) {
+                    vector = qemu_vec;
+                }
+            }
+
+            /* Fall back to PIC vector if IOAPIC not yet configured */
+            if (vector == 0) {
+                vector = (irq < 8) ? (0x20 + irq) : (0x28 + irq - 8);
+            }
+
+            int irq_err = vm_lapic_irq(vcpu, vector);
+
+            {
+                static int inj_log = 0;
+                if (inj_log < 50) {
+                    fprintf(stderr, "IRQ_INJ[%d]: irq=%d pin=%d vec=0x%x err=%d irq0=%ld\n",
+                            inj_log, irq, pin, vector, irq_err,
+                            pic_irq0_assert);
+                    inj_log++;
+                }
+            }
+
+            /* If multiple IRQs pending, re-set the flag for next pre_run */
+            pending &= ~(1u << irq);
+            if (pending) {
+                __atomic_or_fetch(&bhyve_pic_pending_irqs, pending,
+                                  __ATOMIC_RELEASE);
+                cpu_interrupt(cpu, CPU_INTERRUPT_HARD);
+            }
+        }
+
+        /*
+         * Inject pending IOAPIC interrupts.
+         *
+         * The kernel's vmx_inject_interrupts doesn't work for QEMU-mode VMs
+         * because the kernel's vioapic never sees the guest's RTE programming
+         * (QEMU handles IOAPIC MMIO in userspace). So we inject from
+         * userspace using the vectors captured by bhyve_ioapic_set_irq.
+         */
+        uint32_t ioapic_pending = __atomic_exchange_n(
+            &bhyve_ioapic_pending_irqs, 0, __ATOMIC_ACQ_REL);
+        if (ioapic_pending) {
+            while (ioapic_pending) {
+                int pin = __builtin_ctz(ioapic_pending);
+                ioapic_pending &= ~(1u << pin);
+
+                int vector = (pin < 24) ? bhyve_ioapic_vectors[pin] : 0;
+
+                if (vector >= 0x10) {
+                    int err = vm_lapic_irq(vcpu, vector);
+                    {
+                        static int ioapic_inj_log = 0;
+                        if (ioapic_inj_log < 30) {
+                            fprintf(stderr, "IOAPIC_INJ[%d]: pin=%d vec=0x%x err=%d\n",
+                                    ioapic_inj_log, pin, vector, err);
+                            ioapic_inj_log++;
+                        }
+                    }
+                } else {
+                    /* Vector not yet programmed — re-queue */
+                    __atomic_or_fetch(&bhyve_ioapic_pending_irqs,
+                                      (1u << pin), __ATOMIC_RELEASE);
+                }
+            }
+        }
+    }
+
+    if (sync_tpr) {
+        ret = vm_set_register(vcpu, VM_REG_GUEST_TPR, qcpu->tpr);
+    }
+
+    bql_unlock();
+}
+
+static void bhyve_vcpu_post_run(CPUState *cpu) {
+    CPUX86State *env = cpu_env(cpu);
+    X86CPU *x86_cpu = X86_CPU(cpu);
+    AccelCPUState *qcpu = cpu->accel;
+    struct vcpu *vcpu = qcpu->vcpu;
+    uint64_t val;
+    int ret;
+
+    // Set Eflags
+    ret = vm_get_register(vcpu, VM_REG_GUEST_RFLAGS, &env->eflags);
+
+    // TPR
+    ret = vm_get_register(vcpu, VM_REG_GUEST_TPR, &val);
+    if (qcpu->tpr != val) {
+        qcpu->tpr = val;
+        bql_lock();
+        cpu_set_apic_tpr(x86_cpu->apic_state, qcpu->tpr);
+        bql_unlock();
+    }
+}
+
+/* vCPU functions */
+static int bhyve_vcpu_run(CPUState *cpu) {
+    struct bhyve_machine* mach = get_bhyve_mach();
+    X86CPU *x86_cpu = X86_CPU(cpu);
+    CPUX86State *env = &x86_cpu->env;
+    AccelCPUState* qcpu = cpu->accel;
+
+	struct vm_exit vme;
+	struct vm_run vmrun;
+	int error, rc = 0;
+	enum vm_exitcode exitcode;
+    enum vm_suspend_how how;
+	cpuset_t dmask;
+
+    /* Ensure virtual clock is enabled — needed for PIT timer to fire */
+    qemu_clock_enable(QEMU_CLOCK_VIRTUAL, true);
+
+	vmrun.vm_exit = &vme;
+	vmrun.cpuset = &dmask;
+	vmrun.cpusetsize = sizeof(dmask);
+
+    if (cpu->interrupt_request & CPU_INTERRUPT_INIT) {
+        bhyve_cpu_synchronize_state(cpu);
+        do_cpu_init(x86_cpu);
+    }
+    if (cpu->interrupt_request & CPU_INTERRUPT_POLL) {
+        cpu->interrupt_request &= ~CPU_INTERRUPT_POLL;
+        apic_poll_irq(x86_cpu->apic_state);
+    }
+    if (((cpu->interrupt_request & CPU_INTERRUPT_HARD) &&
+         (env->eflags & IF_MASK)) ||
+        (cpu->interrupt_request & CPU_INTERRUPT_NMI)) {
+        cpu->halted = false;
+    }
+    if (cpu->interrupt_request & CPU_INTERRUPT_SIPI) {
+        bhyve_cpu_synchronize_state(cpu);
+        do_cpu_sipi(x86_cpu);
+    }
+
+    if (cpu->interrupt_request & CPU_INTERRUPT_TPR) {
+        cpu->interrupt_request &= ~CPU_INTERRUPT_TPR;
+        bhyve_cpu_synchronize_state(cpu);
+        apic_handle_tpr_access_report(x86_cpu->apic_state, env->eip,
+                                      env->tpr_access_type);
+    }
+
+    bql_unlock();
+    cpu_exec_start(cpu);
+
+	while (rc == 0) {
+        if (qcpu->dirty) {
+            vmm_set_registers(cpu);
+            qcpu->dirty = false;
+        }
+
+        bhyve_vcpu_pre_run(cpu);
+
+        smp_rmb();
+        {
+            static int pre_run_debug = 0; /* set to 1 for VMX register dump */
+            if (pre_run_debug) {
+                uint64_t val;
+                int terr;
+                fprintf(stderr, "\n=== DRY-RUN: Full VMX register dump before vm_run ===\n");
+
+                /* GPRs */
+                terr = vm_get_register(qcpu->vcpu, VM_REG_GUEST_RIP, &val);
+                fprintf(stderr, "  RIP=0x%016lx (get=%d)\n", (unsigned long)val, terr);
+                terr = vm_get_register(qcpu->vcpu, VM_REG_GUEST_RFLAGS, &val);
+                fprintf(stderr, "  RFLAGS=0x%016lx (get=%d)\n", (unsigned long)val, terr);
+                terr = vm_get_register(qcpu->vcpu, VM_REG_GUEST_RAX, &val);
+                fprintf(stderr, "  RAX=0x%016lx\n", (unsigned long)val);
+                terr = vm_get_register(qcpu->vcpu, VM_REG_GUEST_RBX, &val);
+                fprintf(stderr, "  RBX=0x%016lx\n", (unsigned long)val);
+                terr = vm_get_register(qcpu->vcpu, VM_REG_GUEST_RCX, &val);
+                fprintf(stderr, "  RCX=0x%016lx\n", (unsigned long)val);
+                terr = vm_get_register(qcpu->vcpu, VM_REG_GUEST_RDX, &val);
+                fprintf(stderr, "  RDX=0x%016lx\n", (unsigned long)val);
+                terr = vm_get_register(qcpu->vcpu, VM_REG_GUEST_RSP, &val);
+                fprintf(stderr, "  RSP=0x%016lx\n", (unsigned long)val);
+
+                /* Segment selectors + descriptors (base, limit, access) via vm_get_desc */
+                fprintf(stderr, "  --- Segment Registers (from VMCS via vm_get_desc) ---\n");
+                {
+                    int seg_regs[] = { VM_REG_GUEST_CS, VM_REG_GUEST_DS, VM_REG_GUEST_ES,
+                                       VM_REG_GUEST_SS, VM_REG_GUEST_FS, VM_REG_GUEST_GS,
+                                       VM_REG_GUEST_TR, VM_REG_GUEST_LDTR };
+                    const char *seg_names[] = { "CS", "DS", "ES", "SS", "FS", "GS", "TR", "LDTR" };
+                    for (int i = 0; i < 8; i++) {
+                        uint64_t sel_v = 0, base_v = 0;
+                        uint32_t lim_v = 0, acc_v = 0;
+                        vm_get_register(qcpu->vcpu, seg_regs[i], &sel_v);
+                        vm_get_desc(qcpu->vcpu, seg_regs[i], &base_v, &lim_v, &acc_v);
+                        fprintf(stderr, "  %4s: sel=0x%04lx base=0x%016lx limit=0x%08x access=0x%08x\n",
+                                seg_names[i], (unsigned long)sel_v, (unsigned long)base_v, lim_v, acc_v);
+                    }
+                }
+
+                /* GDTR / IDTR */
+                uint64_t gdtr_base = 0, idtr_base = 0;
+                uint32_t gdtr_limit = 0, idtr_limit = 0, dummy_acc = 0;
+                vm_get_desc(qcpu->vcpu, VM_REG_GUEST_GDTR, &gdtr_base, &gdtr_limit, &dummy_acc);
+                vm_get_desc(qcpu->vcpu, VM_REG_GUEST_IDTR, &idtr_base, &idtr_limit, &dummy_acc);
+                fprintf(stderr, "  GDTR: base=0x%016lx limit=0x%04x\n", (unsigned long)gdtr_base, gdtr_limit);
+                fprintf(stderr, "  IDTR: base=0x%016lx limit=0x%04x\n", (unsigned long)idtr_base, idtr_limit);
+
+                /* Control registers */
+                terr = vm_get_register(qcpu->vcpu, VM_REG_GUEST_CR0, &val);
+                fprintf(stderr, "  CR0=0x%016lx (get=%d)\n", (unsigned long)val, terr);
+                terr = vm_get_register(qcpu->vcpu, VM_REG_GUEST_CR3, &val);
+                fprintf(stderr, "  CR3=0x%016lx\n", (unsigned long)val);
+                terr = vm_get_register(qcpu->vcpu, VM_REG_GUEST_CR4, &val);
+                fprintf(stderr, "  CR4=0x%016lx\n", (unsigned long)val);
+                terr = vm_get_register(qcpu->vcpu, VM_REG_GUEST_EFER, &val);
+                fprintf(stderr, "  EFER=0x%016lx\n", (unsigned long)val);
+
+                fprintf(stderr, "=== LIVE RUN: vm_run enabled with iteration limit ===\n");
+                fflush(stderr);
+                pre_run_debug = 0;
+            }
+        }
+		error = vm_run(qcpu->vcpu, &vmrun);
+		vm_run_total++;
+		if ((vm_run_total % 5000000) == 0) {
+		    mmio_print_stats();
+		}
+
+        if (error != 0) {
+            static int vm_run_err_log = 0;
+            if (vm_run_err_log < 5) {
+                fprintf(stderr, "Error running vm: %s (errno=%d, error=%d)\n",
+                        strerror(errno), errno, error);
+                fflush(stderr);
+                vm_run_err_log++;
+            }
+            rc = 1;
+            break;
+        }
+
+        bhyve_vcpu_post_run(cpu);
+
+		exitcode = vme.exitcode;
+
+        /* Minimal exit logging - only HLT exits for now */
+
+        switch (exitcode) {
+        case VM_EXITCODE_HLT:
+            exit_hlt++;
+            /*
+             * Guest executed HLT — waiting for an interrupt.
+             *
+             * Return to QEMU main loop (like KVM does with EXCP_HLT).
+             * The thread loop in bhyve-accel-ops.c calls
+             * qemu_process_cpu_events() which blocks on cpu->halt_cond
+             * while releasing the BQL. This lets the main event loop
+             * advance the virtual clock and run PIT timers.
+             *
+             * When PIT fires → bhyve_pic_set_irq → cpu_interrupt(HARD)
+             * → qemu_cpu_kick → wakes us. The pre-loop interrupt check
+             * clears cpu->halted and we re-enter vm_run.
+             *
+             * LAPIC timer fix: The kernel's vlapic timer fires via
+             * callout and writes to IRR, but vcpu_notify_event does
+             * nothing when vcpu is FROZEN (in userspace). We schedule
+             * a 1ms poll timer that kicks the vcpu so it re-enters
+             * vm_run and the kernel injects the pending interrupt.
+             */
+            {
+                static int hlt_log = 0;
+                if (hlt_log < 30) {
+                    int64_t vclk = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+                    fprintf(stderr, "HLT[%d]: rip=0x%lx vclk=%ld irq0=%ld → EXCP_HLT+lapic_poll\n",
+                            hlt_log, (unsigned long)vme.rip,
+                            (long)vclk, pic_irq0_assert);
+                    fflush(stderr);
+                    hlt_log++;
+                }
+                cpu->halted = true;
+                cpu->exception_index = EXCP_HLT;
+                rc = EXCP_HLT;
+
+                /*
+                 * Start LAPIC poll timer: fires in 1ms to kick the vcpu.
+                 * This ensures the kernel's vlapic timer interrupt
+                 * (pending in IRR) gets injected on next vm_run entry.
+                 */
+                if (!lapic_poll_timer) {
+                    lapic_poll_timer = timer_new_ms(QEMU_CLOCK_REALTIME,
+                                                   lapic_poll_timer_cb, cpu);
+                    lapic_poll_cpu = cpu;
+                }
+                timer_mod(lapic_poll_timer,
+                          qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 1);
+            }
+            break;
+        case VM_EXITCODE_DEBUG:
+            exit_debug++;
+            /* Clear debug state so next vm_run doesn't exit immediately */
+            vm_resume_cpu(qcpu->vcpu);
+            if (exit_debug <= 5) {
+                fprintf(stderr, "DEBUG EXIT #%ld: rip=0x%lx (resume_rc=%d)\n",
+                        exit_debug, (unsigned long)vme.rip,
+                        vm_resume_cpu(qcpu->vcpu));
+            }
+            break;
+        case VM_EXITCODE_INOUT:
+        case VM_EXITCODE_INOUT_STR:
+            exit_inout++;
+            /*
+             * Acquire BQL for I/O emulation — device models (serial, PIC,
+             * etc.) expect it when modifying state and raising interrupts.
+             * This mirrors KVM's pattern of locking BQL for exit handling.
+             */
+            bql_lock();
+            rc = vm_assist_qio(qcpu->vcpu, vmm_io_callback, &vme);
+            bql_unlock();
+            break;
+        case VM_EXITCODE_INST_EMUL:
+            bql_lock();
+            rc = vm_assist_qmem(qcpu->vcpu, vmm_mem_callback, &vme);
+            if (rc == 0) {
+                mmio_kernel_ok++;
+            } else {
+                /*
+                 * MMIO instruction decode failed in kernel vie.
+                 * Perform userspace MMIO emulation: decode the instruction,
+                 * do the actual read/write through QEMU's address_space_rw,
+                 * and update the guest register accordingly.
+                 */
+                struct vie *vie = &vme.u.inst_emul.vie;
+                uint64_t gpa = vme.u.inst_emul.gpa;
+                static int mmio_emul_log = 0;
+
+                if (vie->num_valid == 0) {
+                    if (mmio_emul_log < 5) {
+                        fprintf(stderr, "MMIO EMUL: no instruction bytes at "
+                                "gpa=0x%lx rip=0x%lx\n",
+                                (unsigned long)gpa, (unsigned long)vme.rip);
+                        mmio_emul_log++;
+                    }
+                    bql_unlock();
+                    rc = -1;
+                    break;
+                }
+
+                uint8_t *p = vie->inst;
+                int n = vie->num_valid;
+                int idx = 0;
+                int addr32 = vme.u.inst_emul.cs_d;
+                int op32 = vme.u.inst_emul.cs_d;
+
+                /* x86 reg encoding → VM_REG_GUEST_* */
+                static const int reg_map[8] = {
+                    VM_REG_GUEST_RAX, VM_REG_GUEST_RCX,
+                    VM_REG_GUEST_RDX, VM_REG_GUEST_RBX,
+                    VM_REG_GUEST_RSP, VM_REG_GUEST_RBP,
+                    VM_REG_GUEST_RSI, VM_REG_GUEST_RDI,
+                };
+
+                /* Parse prefixes */
+                while (idx < n) {
+                    uint8_t b = p[idx];
+                    if (b == 0x66) { op32 = !op32; idx++; }
+                    else if (b == 0x67) { addr32 = !addr32; idx++; }
+                    else if (b == 0x26 || b == 0x2e || b == 0x36 ||
+                             b == 0x3e || b == 0x64 || b == 0x65 ||
+                             b == 0xf0 || b == 0xf2 || b == 0xf3) { idx++; }
+                    else if ((b & 0xf0) == 0x40 &&
+                             vme.u.inst_emul.paging.cpu_mode == 4) {
+                        idx++; /* REX prefix */
+                    }
+                    else break;
+                }
+
+                if (idx >= n) {
+                    /* Only prefixes, no opcode — skip all */
+                    vm_set_register(qcpu->vcpu, VM_REG_GUEST_RIP,
+                                    vme.rip + n);
+                    bql_unlock();
+                    rc = 0;
+                    break;
+                }
+
+                uint8_t opcode = p[idx++];
+                int is_write = -1; /* -1 = unknown */
+                int op_size = 0;
+                int reg_field = -1;
+                int is_high_byte = 0;
+                int has_modrm = 0;
+                int imm_size = 0;
+
+                switch (opcode) {
+                case 0x8a: /* MOV r8, r/m8 — byte read */
+                    if (idx >= n) break;
+                    reg_field = (p[idx] >> 3) & 7;
+                    op_size = 1; is_write = 0; has_modrm = 1;
+                    is_high_byte = (reg_field >= 4);
+                    if (is_high_byte) reg_field -= 4;
+                    break;
+                case 0x8b: /* MOV r16/32, r/m16/32 — read */
+                    if (idx >= n) break;
+                    reg_field = (p[idx] >> 3) & 7;
+                    op_size = op32 ? 4 : 2; is_write = 0; has_modrm = 1;
+                    break;
+                case 0x88: /* MOV r/m8, r8 — byte write */
+                    if (idx >= n) break;
+                    reg_field = (p[idx] >> 3) & 7;
+                    op_size = 1; is_write = 1; has_modrm = 1;
+                    is_high_byte = (reg_field >= 4);
+                    if (is_high_byte) reg_field -= 4;
+                    break;
+                case 0x89: /* MOV r/m16/32, r16/32 — write */
+                    if (idx >= n) break;
+                    reg_field = (p[idx] >> 3) & 7;
+                    op_size = op32 ? 4 : 2; is_write = 1; has_modrm = 1;
+                    break;
+                case 0xa0: /* MOV AL, moffs8 */
+                    reg_field = 0; op_size = 1; is_write = 0;
+                    imm_size = addr32 ? 4 : 2;
+                    break;
+                case 0xa1: /* MOV AX/EAX, moffs */
+                    reg_field = 0; op_size = op32 ? 4 : 2; is_write = 0;
+                    imm_size = addr32 ? 4 : 2;
+                    break;
+                case 0xa2: /* MOV moffs8, AL */
+                    reg_field = 0; op_size = 1; is_write = 1;
+                    imm_size = addr32 ? 4 : 2;
+                    break;
+                case 0xa3: /* MOV moffs, AX/EAX */
+                    reg_field = 0; op_size = op32 ? 4 : 2; is_write = 1;
+                    imm_size = addr32 ? 4 : 2;
+                    break;
+                case 0x0f: /* 2-byte opcode */
+                    if (idx < n) {
+                        uint8_t op2 = p[idx++];
+                        if (op2 == 0xb6) {
+                            /* MOVZX r16/32, r/m8 — zero-extend byte read */
+                            if (idx < n) {
+                                reg_field = (p[idx] >> 3) & 7;
+                                op_size = 1; is_write = 0; has_modrm = 1;
+                            }
+                        } else if (op2 == 0xb7) {
+                            /* MOVZX r32, r/m16 — zero-extend word read */
+                            if (idx < n) {
+                                reg_field = (p[idx] >> 3) & 7;
+                                op_size = 2; is_write = 0; has_modrm = 1;
+                            }
+                        } else {
+                            has_modrm = 1; /* most 0F opcodes have ModRM */
+                        }
+                    }
+                    break;
+                case 0xc6: /* MOV r/m8, imm8 — immediate byte write */
+                    op_size = 1; is_write = 2; /* 2 = imm write */
+                    has_modrm = 1; imm_size = 1;
+                    break;
+                case 0xc7: /* MOV r/m16/32, imm — immediate write */
+                    op_size = op32 ? 4 : 2; is_write = 2;
+                    has_modrm = 1; imm_size = op_size;
+                    break;
+                default:
+                    /* Unsupported opcode for MMIO emulation */
+                    break;
+                }
+
+                /* Calculate instruction length (skip past ModRM/SIB/disp) */
+                int inst_len = idx; /* past prefixes + opcode */
+                if (has_modrm && idx < n) {
+                    uint8_t modrm = p[idx++];
+                    uint8_t mod = modrm >> 6;
+                    uint8_t rm = modrm & 7;
+                    inst_len = idx;
+                    if (mod != 3) {
+                        if (addr32) {
+                            if (rm == 4 && idx < n) { idx++; inst_len = idx; }
+                            if (mod == 0 && rm == 5) idx += 4;
+                            else if (mod == 1) idx += 1;
+                            else if (mod == 2) idx += 4;
+                        } else {
+                            if (mod == 0 && rm == 6) idx += 2;
+                            else if (mod == 1) idx += 1;
+                            else if (mod == 2) idx += 2;
+                        }
+                        inst_len = idx;
+                    }
+                }
+                int imm_start = idx;
+                inst_len = idx + imm_size;
+                if (inst_len > n) inst_len = n;
+                if (inst_len == 0) inst_len = 3; /* last resort */
+
+                /* Perform the actual MMIO operation */
+                if (is_write == 0 && reg_field >= 0 && op_size > 0) {
+                    /* MMIO READ: read from device, put into guest register */
+                    mmio_user_read++;
+                    mmio_last_gpa = gpa;
+                    uint8_t data[8] = {0};
+                    address_space_rw(&address_space_memory, gpa,
+                                     MEMTXATTRS_UNSPECIFIED,
+                                     data, op_size, false);
+                    uint64_t regval;
+                    vm_get_register(qcpu->vcpu, reg_map[reg_field], &regval);
+                    if (op_size == 1) {
+                        if (is_high_byte)
+                            regval = (regval & ~0xFF00ULL) |
+                                     ((uint64_t)data[0] << 8);
+                        else
+                            regval = (regval & ~0xFFULL) | data[0];
+                    } else if (op_size == 2) {
+                        uint16_t v;
+                        memcpy(&v, data, 2);
+                        regval = (regval & ~0xFFFFULL) | v;
+                    } else if (op_size == 4) {
+                        uint32_t v;
+                        memcpy(&v, data, 4);
+                        regval = v; /* 32-bit zero-extends */
+                    }
+                    vm_set_register(qcpu->vcpu, reg_map[reg_field], regval);
+
+                    if (mmio_emul_log < 5) {
+                        fprintf(stderr, "MMIO READ: gpa=0x%lx size=%d "
+                                "val=0x%lx → reg%d (inst_len=%d)\n",
+                                (unsigned long)gpa, op_size,
+                                (unsigned long)(op_size == 1 ? data[0] :
+                                 op_size == 2 ? *(uint16_t*)data :
+                                 *(uint32_t*)data),
+                                reg_field, inst_len);
+                        mmio_emul_log++;
+                    }
+                } else if (is_write == 1 && reg_field >= 0 && op_size > 0) {
+                    /* MMIO WRITE: read from guest register, write to device */
+                    mmio_user_write++;
+                    mmio_last_gpa = gpa;
+                    uint64_t regval;
+                    vm_get_register(qcpu->vcpu, reg_map[reg_field], &regval);
+                    uint8_t data[8] = {0};
+                    if (is_high_byte)
+                        data[0] = (regval >> 8) & 0xFF;
+                    else
+                        memcpy(data, &regval, op_size);
+                    address_space_rw(&address_space_memory, gpa,
+                                     MEMTXATTRS_UNSPECIFIED,
+                                     data, op_size, true);
+
+                    if (mmio_emul_log < 50) {
+                        fprintf(stderr, "MMIO WRITE: gpa=0x%lx size=%d "
+                                "val=0x%lx from reg%d\n",
+                                (unsigned long)gpa, op_size,
+                                (unsigned long)(op_size == 1 ? data[0] :
+                                 op_size == 2 ? *(uint16_t*)data :
+                                 *(uint32_t*)data),
+                                reg_field);
+                        mmio_emul_log++;
+                    }
+                } else if (is_write == 2 && op_size > 0) {
+                    /* MMIO WRITE from immediate value */
+                    mmio_user_write++;
+                    mmio_last_gpa = gpa;
+                    uint8_t data[8] = {0};
+                    if (imm_start + imm_size <= n)
+                        memcpy(data, &p[imm_start], imm_size);
+                    address_space_rw(&address_space_memory, gpa,
+                                     MEMTXATTRS_UNSPECIFIED,
+                                     data, op_size, true);
+
+                    if (mmio_emul_log < 10) {
+                        fprintf(stderr, "MMIO WRITE IMM: gpa=0x%lx size=%d "
+                                "val=0x%lx\n",
+                                (unsigned long)gpa, op_size,
+                                (unsigned long)(op_size == 1 ? data[0] :
+                                 op_size == 2 ? *(uint16_t*)data :
+                                 *(uint32_t*)data));
+                        mmio_emul_log++;
+                    }
+                } else {
+                    /* Can't decode — log and skip (old behavior) */
+                    mmio_user_skip++;
+                    if (mmio_emul_log < 20) {
+                        fprintf(stderr, "MMIO SKIP: gpa=0x%lx rip=0x%lx "
+                                "opcode=0x%02x inst:",
+                                (unsigned long)gpa, (unsigned long)vme.rip,
+                                opcode);
+                        for (int j = 0; j < vie->num_valid && j < 15; j++)
+                            fprintf(stderr, " %02x", vie->inst[j]);
+                        fprintf(stderr, "\n");
+                        fflush(stderr);
+                        mmio_emul_log++;
+                    }
+                }
+
+                vm_set_register(qcpu->vcpu, VM_REG_GUEST_RIP,
+                                vme.rip + inst_len);
+                rc = 0;
+            }
+            bql_unlock();
+            break;
+        case VM_EXITCODE_RDMSR:
+            rc = bhyve_rdmsr(qcpu->vcpu, &vme);
+            if (rc) {
+                static int rdmsr_err_count = 0;
+                if (rdmsr_err_count < 10) {
+                    printf("bhyve: rdmsr 0x%x failed\n", vme.u.msr.code);
+                    rdmsr_err_count++;
+                }
+                continue;
+            }
+            break;
+        case VM_EXITCODE_WRMSR:
+            rc = bhyve_wrmsr(&vme);
+            if (rc) {
+                static int wrmsr_err_count = 0;
+                if (wrmsr_err_count < 10) {
+                    printf("bhyve: wrmsr 0x%x failed\n", vme.u.msr.code);
+                    wrmsr_err_count++;
+                }
+                continue;
+            }
+            break;
+        case VM_EXITCODE_BOGUS:
+            exit_bogus++;
+            /* Run timers periodically on BOGUS exits too */
+            if ((exit_bogus % 100) == 0) {
+                bql_lock();
+                qemu_clock_run_timers(QEMU_CLOCK_VIRTUAL);
+                {
+                    AioContext *ctx = qemu_get_aio_context();
+                    timerlistgroup_run_timers(&ctx->tlg);
+                    aio_poll(ctx, false);
+                }
+                bql_unlock();
+            }
+            break;
+        case VM_EXITCODE_SUSPENDED:
+            how = vme.u.suspended.how;
+
+            switch (how) {
+            case VM_SUSPEND_RESET:
+                exit(0);
+            case VM_SUSPEND_POWEROFF:
+                qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
+                cpu->exception_index = EXCP_INTERRUPT;
+                vm_destroy(mach->vm);
+                rc = 1;
+                break;
+            default:
+                rc = 1;
+            }
+            break;
+        case VM_EXITCODE_VMX:
+            dump_registers(qcpu->vcpu);
+            rc = -1;
+            break;
+        case VM_EXITCODE_SVM:
+            rc = -1;
+            break;
+        case VM_EXITCODE_PAUSE:
+            exit_pause++;
+            /*
+             * Guest executed PAUSE — typically in a spin-wait loop.
+             * We must periodically run QEMU timers so the PIT can fire
+             * IRQ0 (timer interrupt) into the guest. Without this, the
+             * guest never receives timer ticks and gets stuck forever
+             * in busy-wait loops (e.g., i8042 probing, calibration).
+             */
+            if ((exit_pause % 10000) == 0) {
+                bql_lock();
+                qemu_clock_run_timers(QEMU_CLOCK_VIRTUAL);
+                {
+                    AioContext *ctx = qemu_get_aio_context();
+                    timerlistgroup_run_timers(&ctx->tlg);
+                    aio_poll(ctx, false);
+                }
+                bql_unlock();
+            }
+            continue;
+        case VM_EXITCODE_IPI:
+            printf("Received an IPI\n");
+            break;
+        default:
+            exit_other++;
+            printf("Unhandled exit (code=%d). Register Dump...\n", exitcode);
+            dump_registers(qcpu->vcpu);
+            bql_lock();
+            qemu_system_guest_panicked(cpu_get_crash_info(cpu));
+            bql_unlock();
+            break;
+        }
+	}
+
+    cpu_exec_end(cpu);
+    bql_lock();
+
+    qatomic_set(&cpu->exit_request, false);
+
+    return rc;
+}
+/* End vCPU functions */
+
+static void
+bhyve_ipi_signal(int sigcpu)
+{
+    if (current_cpu) {
+        AccelCPUState *qcpu = current_cpu->accel;
+
+        vm_suspend_cpu(qcpu->vcpu);
+    }
+}
+
+static void
+bhyve_init_cpu_signals(void)
+{
+    struct sigaction sigact;
+    sigset_t set;
+
+    /* Install the IPI handler. */
+    memset(&sigact, 0, sizeof(sigact));
+    sigact.sa_handler = bhyve_ipi_signal;
+    sigaction(SIG_IPI, &sigact, NULL);
+
+    /* Allow IPIs on the current thread. */
+    sigprocmask(SIG_BLOCK, NULL, &set);
+    sigdelset(&set, SIG_IPI);
+    pthread_sigmask(SIG_SETMASK, &set, NULL);
+}
+
+/* vCPU initialization functions */
+int bhyve_init_vcpu(CPUState *cpu)
+{
+    struct bhyve_machine* mach = get_bhyve_mach();
+
+    AccelCPUState *qcpu;
+    int err, tmp;
+
+    qcpu = g_new0(AccelCPUState, 1);
+    bhyve_init_cpu_signals();
+
+    // Create vCPU
+    qcpu->vcpu = vm_vcpu_open(mach->vm, cpu->cpu_index); // cpu_index 0 is BSP
+    fprintf(stderr, "vcpu_open: cpu_index=%d vcpu=%p\n", cpu->cpu_index, (void*)qcpu->vcpu);
+
+    err = vm_get_capability(qcpu->vcpu, VM_CAP_HALT_EXIT, &tmp);
+    if (err < 0) {
+		fprintf(stderr, "Could not get capability halt exit (%d)\n", err);
+    }
+    err = vm_set_capability(qcpu->vcpu, VM_CAP_HALT_EXIT, 1);
+    fprintf(stderr, "set HALT_EXIT: %d\n", err);
+
+    err = vm_set_capability(qcpu->vcpu, VM_CAP_PAUSE_EXIT, 0);
+    fprintf(stderr, "set PAUSE_EXIT(disabled): %d\n", err);
+
+    err = vm_set_x2apic_state(qcpu->vcpu, X2APIC_DISABLED);
+    fprintf(stderr, "set x2apic: %d\n", err);
+
+	err = vm_set_capability(qcpu->vcpu, VM_CAP_ENABLE_INVPCID, 1);
+    fprintf(stderr, "set INVPCID: %d\n", err);
+
+	err = vm_set_capability(qcpu->vcpu, VM_CAP_IPI_EXIT, 1);
+    fprintf(stderr, "set IPI_EXIT: %d\n", err);
+
+    // Start vCPU
+    if (cpu->cpu_index == 0) { // BSP
+        // Can run in real mode
+        err = vm_set_capability(qcpu->vcpu,
+            VM_CAP_UNRESTRICTED_GUEST, 1);
+        fprintf(stderr, "set UNRESTRICTED_GUEST: %d\n", err);
+
+        err = vcpu_reset(qcpu->vcpu);
+        fprintf(stderr, "vcpu_reset: %d\n", err);
+        assert(err == 0);
+
+        /*
+         * Disable vLAPIC software-enable (SVR bit 8) so that
+         * vlapic_trigger_lvt() takes the "LAPIC disabled" bypass
+         * path, which calls vm_inject_extint() directly instead
+         * of going through vlapic_fire_lvt() → lvt_last[] mask
+         * check.  lapic_set_state() updates the LAPIC page but
+         * NOT the cached lvt_last[] array, so setting LINT0=ExtINT
+         * via set_state never takes effect.  Clearing SVR enable
+         * avoids that entire code path.
+         */
+        {
+            struct vm_lapic_state lapic_state;
+            int lapic_err;
+
+            lapic_err = vm_lapic_get_state(qcpu->vcpu, &lapic_state);
+            if (lapic_err == 0) {
+                uint32_t old_svr = lapic_state.fields[0xf].data;
+                lapic_state.fields[0xf].data &= ~0x100; /* clear APIC_SVR_ENABLE */
+                lapic_err = vm_lapic_set_state(qcpu->vcpu, &lapic_state);
+                fprintf(stderr, "SVR disable: old=0x%x new=0x%x set_err=%d\n",
+                        old_svr, lapic_state.fields[0xf].data, lapic_err);
+            } else {
+                fprintf(stderr, "SVR disable: get_state failed err=%d\n",
+                        lapic_err);
+            }
+        }
+    } else {
+        err = vcpu_reset(qcpu->vcpu);
+        err = vm_set_capability(qcpu->vcpu,
+            VM_CAP_UNRESTRICTED_GUEST, 1);
+    }
+
+    /* Activate and suspend CPU (required by bhyve protocol — suspend sets
+     * debug_cpus, resume clears it before the first vm_run) */
+    err = vm_activate_cpu(qcpu->vcpu);
+    fprintf(stderr, "vm_activate_cpu: %d\n", err);
+    err = vm_suspend_cpu(qcpu->vcpu);
+    fprintf(stderr, "vm_suspend_cpu: %d\n", err);
+
+    // Sync registers on exec
+    qcpu->dirty = true;
+    cpu->accel = qcpu;
+
+
+    return 0; // Return success
+}
+
+void bhyve_destroy_vcpu(CPUState *cpu) {
+    struct bhyve_machine* mach = get_bhyve_mach();
+
+    AccelCPUState *qcpu = cpu->accel;
+
+    vm_vcpu_close(qcpu->vcpu);
+}
+
+int bhyve_vcpu_exec(CPUState *cpu)
+{
+    int ret;
+    static int resume_debug = 1;
+    while (1) {
+        if (cpu->exception_index >= EXCP_INTERRUPT) {
+            ret = cpu->exception_index;
+            cpu->exception_index = -1;
+            break;
+        }
+
+        ret = vm_resume_cpu(cpu->accel->vcpu);
+        if (resume_debug) {
+            fprintf(stderr, "vm_resume_cpu: %d (errno=%d)\n", ret, errno);
+            resume_debug = 0;
+        }
+        ret = bhyve_vcpu_run(cpu);
+        if (ret != 0) {
+            break;
+        }
+    }
+
+    return ret;
+}
+
+static void
+do_bhyve_cpu_synchronize_state(CPUState *cpu, run_on_cpu_data arg)
+{
+    vmm_get_registers(cpu);
+    cpu->accel->dirty = true;
+}
+
+static void
+do_bhyve_cpu_synchronize_post_reset(CPUState *cpu, run_on_cpu_data arg)
+{
+    vmm_set_registers(cpu);
+    cpu->accel->dirty = false;
+}
+
+static void
+do_bhyve_cpu_synchronize_pre_loadvm(CPUState *cpu, run_on_cpu_data arg)
+{
+    cpu->accel->dirty = true;
+}
+
+/* State Synchronization */
+void bhyve_cpu_synchronize_state(CPUState *cpu)
+{
+    if (!cpu->accel->dirty) {
+        run_on_cpu(cpu, do_bhyve_cpu_synchronize_state, RUN_ON_CPU_NULL);
+    }
+}
+
+void bhyve_cpu_synchronize_post_reset(CPUState *cpu)
+{
+    run_on_cpu(cpu, do_bhyve_cpu_synchronize_post_reset, RUN_ON_CPU_NULL);
+}
+
+void bhyve_cpu_synchronize_post_init(CPUState *cpu)
+{
+    run_on_cpu(cpu, do_bhyve_cpu_synchronize_post_reset, RUN_ON_CPU_NULL);
+}
+
+void bhyve_cpu_synchronize_pre_loadvm(CPUState *cpu)
+{
+    run_on_cpu(cpu, do_bhyve_cpu_synchronize_pre_loadvm, RUN_ON_CPU_NULL);
+}
+/* End State Syncrhonization */
+
+/* Memory Support */
+struct bhyve_seg_and_off {
+    struct bhyve_host_seg seg;
+    size_t offset;
+};
+
+static struct bhyve_seg_and_off calc_segoff_from_vmap(GArray *host_vmap, void* host_va) {
+    struct bhyve_seg_and_off ret;
+    struct bhyve_host_seg seg;
+    for (size_t i = 0; i < host_vmap->len; i++) {
+        seg = g_array_index(host_vmap, struct bhyve_host_seg, i);
+        if (IN_MEMRANGE((char *)seg.seg_start, seg.size, (char *)host_va)) {
+            ret.offset = (char*)host_va - (char*)seg.seg_start;
+            ret.seg = seg;
+            return ret;
+        }
+    }
+
+    ret.offset = -1;
+    return ret;
+}
+
+static void bhyve_update_mapping(hwaddr start_pa, ram_addr_t size,
+                                 void *host_va, int add, int rom,
+                                 const char *name)
+{
+    struct bhyve_machine *mach = get_bhyve_mach();
+    struct bhyve_seg_and_off segoff;
+    int prot, ret;
+    segoff = calc_segoff_from_vmap(mach->host_vmap, host_va);
+
+    if (add) {
+        prot = PROT_READ | PROT_EXEC;
+        if (!rom) {
+            prot |= PROT_WRITE;
+        }
+        ret = vm_mmap_memseg(mach->vm, start_pa, segoff.seg.segid, segoff.offset, size, prot);
+    } else {
+        ret = vm_munmap_memseg(mach->vm, start_pa, size);
+    }
+}
+
+static void bhyve_process_section(MemoryRegionSection *section, int add)
+{
+    MemoryRegion *mr = section->mr;
+    hwaddr start_pa = section->offset_within_address_space;
+    ram_addr_t size = int128_get64(section->size);
+    unsigned int delta;
+    uint64_t host_va;
+
+    // Even Bios and ROM is backed by ram (except UEFI mode)
+    if (!memory_region_is_ram(mr) && strcmp(mr->name, "system.flash0") && strcmp(mr->name, "system.flash1")) {
+        return;
+    }
+
+    // Ensure MemoryRegion is aligned on page boundary and size is multiple of page size
+    delta = qemu_real_host_page_size() - (start_pa & ~qemu_real_host_page_mask());
+    delta &= ~qemu_real_host_page_mask();
+    if (delta > size) {
+        return;
+    }
+    start_pa += delta;
+    size -= delta;
+    size &= qemu_real_host_page_mask();
+    if (!size || (start_pa & ~qemu_real_host_page_mask())) {
+        return;
+    }
+
+    host_va = (uintptr_t)memory_region_get_ram_ptr(mr) +
+        section->offset_within_region + delta;
+
+    bhyve_update_mapping(start_pa, size, (void*)(uintptr_t)host_va, add,
+        memory_region_is_rom(mr), mr->name);
+    return;
+}
+
+static void bhyve_region_add(MemoryListener *listener,
+                             MemoryRegionSection *section)
+{
+    memory_region_ref(section->mr);
+    bhyve_process_section(section, 1);
+}
+
+static void bhyve_region_del(MemoryListener *listener,
+                             MemoryRegionSection *section)
+{
+    bhyve_process_section(section, 0);
+    memory_region_unref(section->mr);
+}
+
+static void bhyve_transaction_begin(MemoryListener *listener)
+{
+}
+
+static void bhyve_transaction_commit(MemoryListener *listener)
+{
+}
+
+static void bhyve_log_sync(MemoryListener *listener,
+                           MemoryRegionSection *section)
+{
+    MemoryRegion *mr = section->mr;
+
+    if (!memory_region_is_ram(mr)) {
+        return;
+    }
+
+    memory_region_set_dirty(mr, 0, int128_get64(section->size));
+}
+
+static MemoryListener bhyve_memory_listener = {
+    .name = "bhyve",
+    .begin = bhyve_transaction_begin,
+    .commit = bhyve_transaction_commit,
+    .region_add = bhyve_region_add,
+    .region_del = bhyve_region_del,
+    .log_sync = bhyve_log_sync,
+    .priority = MEMORY_LISTENER_PRIORITY_ACCEL,
+};
+
+static void bhyve_memory_init(void)
+{
+    memory_listener_register(&bhyve_memory_listener, &address_space_memory);
+}
+
+/* Allocate memory */
+static void* bhyve_allocate_pc_memory(size_t mr_size, const char* name, int segid) {
+    struct bhyve_machine *mach = get_bhyve_mach();
+    char* baseaddr;
+    int err;
+
+    err = vm_setup_qmemory(mach->vm, mr_size, segid, VM_MMAP_ALL, name);
+    if (err < 0) {
+        fprintf(stderr, "Couldn't setup PC Memory\n");
+        exit(4);
+    }
+
+    err = vm_get_guestmem_from_ctx(mach->vm, &baseaddr, NULL, NULL);
+    if (err < 0) {
+        fprintf(stderr, "Couldn't access machine baseaddr\n");
+        exit(4);
+    }
+    return baseaddr;
+}
+
+static char *bhyve_serialize_name(const char *input, int segid) {
+    if (!input) return NULL;
+
+    /*
+     * Produce a unique name that fits in VM_MAX_SUFFIXLEN (15) chars.
+     * Format: up to 12 alphanumeric chars from input + "_" + segid (decimal).
+     * Strip '/', '@', and other non-alnum characters.
+     */
+    #define MAX_PREFIX 12
+    char prefix[MAX_PREFIX + 1];
+    size_t len = strlen(input);
+    size_t j = 0;
+
+    /* Scan from the end to get the most distinctive part */
+    size_t start = 0;
+    size_t count = 0;
+    for (size_t k = len; k > 0; k--) {
+        char c = input[k - 1];
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+            (c >= '0' && c <= '9') || c == '.' || c == '-') {
+            count++;
+            if (count == MAX_PREFIX) {
+                start = k - 1;
+                break;
+            }
+        }
+        if (count > 0 && start == 0) start = k - 1;
+    }
+    if (count < MAX_PREFIX) start = 0;
+
+    for (size_t k = start; k < len && j < MAX_PREFIX; k++) {
+        char c = input[k];
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+            (c >= '0' && c <= '9') || c == '.' || c == '-') {
+            prefix[j++] = c;
+        }
+    }
+    prefix[j] = '\0';
+
+    /* Build final name: prefix_segid */
+    char *output = malloc(16); /* VM_MAX_SUFFIXLEN + 1 */
+    if (!output) return NULL;
+    snprintf(output, 16, "%s_%d", prefix, segid);
+    return output;
+    #undef MAX_PREFIX
+}
+
+
+void *bhyve_ram_alloc(size_t mr_size, uint64_t *alignment, int flags, const char* name) {
+    struct bhyve_machine *mach = get_bhyve_mach();
+    struct bhyve_host_seg ram_memseg;
+    ram_memseg.mmap_flags = MAP_SHARED | MAP_NORESERVE | MAP_FIXED;
+    ram_memseg.segid = mach->segid_num;
+    ram_memseg.size = mr_size;
+    ram_memseg.name = bhyve_serialize_name(name, ram_memseg.segid);
+    puts(name);
+
+    if (strcmp(name, "pc.ram") == 0) {
+        ram_memseg.seg_start = bhyve_allocate_pc_memory(mr_size, ram_memseg.name, mach->segid_num++);
+    } else {
+        fprintf(stderr, "  vm_create_devmem(segid=%d, name='%s', size=%zu)\n",
+                mach->segid_num, ram_memseg.name, mr_size);
+        ram_memseg.seg_start = vm_create_devmem(mach->vm, mach->segid_num++, ram_memseg.name, mr_size);
+        if (!ram_memseg.seg_start || ram_memseg.seg_start == (void*)SIZE_MAX) {
+            fprintf(stderr, "  vm_create_devmem FAILED: errno=%d (%s)\n", errno, strerror(errno));
+        }
+    }
+    if (!ram_memseg.seg_start || ram_memseg.seg_start == (void*)SIZE_MAX) {
+        fprintf(stderr, "Could not allocate device memory for %s\n", name);
+        exit(4);
+    }
+    *alignment = SUPERPAGE_SIZE;
+    g_array_append_val(mach->host_vmap, ram_memseg);
+    return ram_memseg.seg_start;
+
+}
+/* End Memory Support */
+
+/* Kernel IRQchip Processing */
+static void bhyve_set_kernel_irqchip(Object *obj, Visitor *v,
+                                   const char *name, void *opaque,
+                                   Error **errp)
+{
+    struct bhyve_machine *mach = &bhyve_mach;
+    OnOffSplit mode;
+
+    if (!visit_type_OnOffSplit(v, name, &mode, errp)) {
+        return;
+    }
+
+    switch (mode) {
+    case ON_OFF_SPLIT_ON:
+        /* In kernel LAPIC */
+        mach->kernel_irqchip_required = true;
+        break;
+
+    case ON_OFF_SPLIT_OFF:
+        /* QEMU userspace emulated LAPIC */
+        mach->kernel_irqchip_required = false;
+        break;
+
+    case ON_OFF_SPLIT_SPLIT:
+        error_setg(errp, "Bhyve: split irqchip currently not supported");
+        error_append_hint(errp,
+            "Try without kernel-irqchip or with kernel-irqchip=on|off");
+        break;
+
+    default:
+        /*
+         * The value was checked in visit_type_OnOffSplit() above. If
+         * we get here, then something is wrong in QEMU.
+         */
+        abort();
+    }
+}
+
+bool bhyve_apic_in_platform(void) {
+    return bhyve_mach.kernel_irqchip_required;
+}
+/* End Kernel IRQchip Processing */
+
+static int do_open(const char *vmname, MachineState* ms) {
+    /* Temporary Machine Initialization*/
+    struct bhyve_machine* mach = get_bhyve_mach();
+    int err;
+
+    // Close last VM if it exists
+    if ((mach->vm = vm_open(vmname))) {
+        vm_destroy(mach->vm);
+        mach->vm = NULL;
+    }
+
+    //In the original code segid_num was initialized with 1, keeping this. But the docs say IDs are from 0 to 15...
+    mach->segid_num = 1;
+    mach->vm = vm_openf(vmname, VMMAPI_OPEN_CREATE);
+
+    if (mach->vm == NULL) {
+        fprintf(stderr, "bhyve: vm_openf('%s') failed: %s (errno=%d)\n"
+                "  Hint: run as root, or destroy stale VM with: "
+                "bhyvectl --vm=%s --destroy\n",
+                vmname, strerror(errno), errno, vmname);
+        return -1;
+    }
+
+    // Set Topology
+    err = vm_set_flags(mach->vm, VM_OP_F_QEMU);
+    if (err) {
+        fprintf(stderr, "bhyve: vm_set_flags failed: %s (errno=%d)\n",
+                strerror(errno), errno);
+        return -1;
+    }
+    err = vm_set_topology(mach->vm, ms->smp.sockets, ms->smp.cores, ms->smp.threads, 0);
+
+    vm_set_memflags(mach->vm, 0);
+
+    /* End Memory */
+    return err;
+}
+
+
+static int
+bhyve_accel_init(AccelState *as, MachineState *ms)
+{
+    int err;
+    printf("Bhyve Accelerator Machine Initialization\n");
+    atexit(mmio_print_stats);
+    /* Also handle SIGTERM (from timeout) */
+    signal(SIGTERM, SIG_DFL); /* Will be overridden below */
+
+    err = do_open(VM_NAME, ms);
+    if (err) {
+        return -1;
+    }
+
+    /* Setup Memory */
+    bhyve_memory_init();
+    return 0;
+}
+
+static void
+bhyve_accel_class_init(ObjectClass *oc, const void *data)
+{
+    AccelClass *ac = ACCEL_CLASS(oc);
+    ac->name = "Bhyve";
+    ac->init_machine = bhyve_accel_init;
+    ac->allowed = &bhyve_allowed;
+
+    object_class_property_add(oc, "kernel-irqchip", "on|off|split",
+        NULL, bhyve_set_kernel_irqchip,
+        NULL, NULL);
+    object_class_property_set_description(oc, "kernel-irqchip",
+        "Configure Bhyve in-kernel irqchip");
+}
+
+static void bhyve_accel_instance_init(Object *obj)
+{
+    struct bhyve_machine *bhyvep = &bhyve_mach;
+
+    memset(bhyvep, 0, sizeof(struct bhyve_machine));
+    bhyvep->host_vmap = g_array_new(FALSE, FALSE, sizeof(struct bhyve_host_seg));
+
+    /* Turn off kernel-irqchip, by default */
+    bhyvep->kernel_irqchip_required = true;
+    bhyvep->cpu_vendor = get_cpu_vendor();
+}
+
+static const TypeInfo bhyve_accel_type = {
+    .name = ACCEL_CLASS_NAME("bhyve"),
+    .parent = TYPE_ACCEL,
+    // Initializes instance specific data
+    .instance_init = bhyve_accel_instance_init,
+    // Called once when first loaded
+    .class_init = bhyve_accel_class_init,
+};
+
+static void
+bhyve_type_init(void)
+{
+    type_register_static(&bhyve_accel_type);
+}
+
+type_init(bhyve_type_init);

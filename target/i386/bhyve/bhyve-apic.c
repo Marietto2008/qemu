@@ -149,10 +149,19 @@ static void bhyve_send_msi(MSIMessage *msg)
     uint64_t addr = msg->address;
     uint32_t data = msg->data;
 
-    int err = vm_lapic_msi(bhyve_mach.vm, addr + 0xFEE00000, data);
+    /*
+     * msg->address from PCI MSI already contains the full physical
+     * address (0xFEE0xxxx) as programmed by the guest into the device's
+     * MSI capability registers. Pass it directly to the kernel.
+     */
+    int err = vm_lapic_msi(bhyve_mach.vm, addr, data);
     if (err) {
-        fprintf(stderr, "bhyve: injection failed, MSI (%llx, %x)",
-                addr, data);
+        static int msi_err_log = 0;
+        if (msi_err_log < 20) {
+            fprintf(stderr, "bhyve: MSI injection failed addr=0x%llx data=0x%x err=%d\n",
+                    (unsigned long long)addr, data, err);
+            msi_err_log++;
+        }
     }
 }
 
@@ -165,7 +174,13 @@ static uint64_t bhyve_apic_mem_read(void *opaque, hwaddr addr,
 static void bhyve_apic_mem_write(void *opaque, hwaddr addr,
                                 uint64_t data, unsigned size)
 {
-    MSIMessage msg = { .address = addr, .data = data };
+    /*
+     * This is called for guest MMIO writes to the LAPIC region.
+     * The addr parameter is an offset from the APIC base (0xFEE00000),
+     * so we must add the base to form the full physical address that
+     * vm_lapic_msi expects.
+     */
+    MSIMessage msg = { .address = addr + 0xFEE00000ULL, .data = data };
     bhyve_send_msi(&msg);
 }
 
