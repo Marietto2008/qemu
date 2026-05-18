@@ -46,6 +46,34 @@ static volatile long exit_debug = 0;
 static volatile long exit_other = 0;
 static volatile long exit_pause = 0;
 
+/*
+ * LAPIC timer polling mechanism.
+ *
+ * Problem: The kernel's vlapic timer fires via callout and writes the
+ * interrupt vector into the vLAPIC IRR. It then calls vcpu_notify_event(),
+ * but when the vcpu has returned to userspace (VCPU_FROZEN state), that
+ * function does nothing — it only handles VCPU_RUNNING and VCPU_SLEEPING.
+ * So QEMU never learns that a LAPIC timer interrupt is pending in the IRR.
+ *
+ * Fix: When the guest HLTs, we start a 1ms one-shot timer. When it fires,
+ * it calls cpu_interrupt(HARD) which wakes the vcpu from halt_cond.
+ * The vcpu then re-enters vm_run, and the kernel's vmx_inject_interrupts
+ * finds the pending interrupt in IRR and injects it into the guest.
+ *
+ * If the guest HLTs again (no interrupt was pending), we restart the timer.
+ * Effective poll rate: ~1000 Hz, matching Linux's default LAPIC timer freq.
+ */
+static QEMUTimer *lapic_poll_timer;
+static CPUState *lapic_poll_cpu;
+
+static void lapic_poll_timer_cb(void *opaque)
+{
+    CPUState *cpu = (CPUState *)opaque;
+    if (cpu && cpu->halted) {
+        cpu_interrupt(cpu, CPU_INTERRUPT_HARD);
+    }
+}
+
 static void mmio_print_stats(void) {
     fprintf(stderr, "\n=== MMIO/IO Statistics ===\n"
             "  vm_run calls:    %ld\n"
@@ -1228,12 +1256,18 @@ static int bhyve_vcpu_run(CPUState *cpu) {
              * When PIT fires → bhyve_pic_set_irq → cpu_interrupt(HARD)
              * → qemu_cpu_kick → wakes us. The pre-loop interrupt check
              * clears cpu->halted and we re-enter vm_run.
+             *
+             * LAPIC timer fix: The kernel's vlapic timer fires via
+             * callout and writes to IRR, but vcpu_notify_event does
+             * nothing when vcpu is FROZEN (in userspace). We schedule
+             * a 1ms poll timer that kicks the vcpu so it re-enters
+             * vm_run and the kernel injects the pending interrupt.
              */
             {
                 static int hlt_log = 0;
                 if (hlt_log < 30) {
                     int64_t vclk = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-                    fprintf(stderr, "HLT[%d]: rip=0x%lx vclk=%ld irq0=%ld → EXCP_HLT\n",
+                    fprintf(stderr, "HLT[%d]: rip=0x%lx vclk=%ld irq0=%ld → EXCP_HLT+lapic_poll\n",
                             hlt_log, (unsigned long)vme.rip,
                             (long)vclk, pic_irq0_assert);
                     fflush(stderr);
@@ -1242,6 +1276,19 @@ static int bhyve_vcpu_run(CPUState *cpu) {
                 cpu->halted = true;
                 cpu->exception_index = EXCP_HLT;
                 rc = EXCP_HLT;
+
+                /*
+                 * Start LAPIC poll timer: fires in 1ms to kick the vcpu.
+                 * This ensures the kernel's vlapic timer interrupt
+                 * (pending in IRR) gets injected on next vm_run entry.
+                 */
+                if (!lapic_poll_timer) {
+                    lapic_poll_timer = timer_new_ms(QEMU_CLOCK_REALTIME,
+                                                   lapic_poll_timer_cb, cpu);
+                    lapic_poll_cpu = cpu;
+                }
+                timer_mod(lapic_poll_timer,
+                          qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 1);
             }
             break;
         case VM_EXITCODE_DEBUG:
