@@ -45,6 +45,8 @@ static void bhyve_pic_reset(DeviceState *dev)
 volatile long pic_irq0_assert = 0;
 volatile long pic_irq0_deassert = 0;
 volatile long pic_other_irq = 0;
+volatile long pic_irq4_assert = 0;
+volatile long pic_irq4_deassert = 0;
 
 /*
  * Bitmask of pending ISA IRQs for userspace injection.
@@ -63,6 +65,17 @@ static void bhyve_pic_set_irq(void *opaque, int irq, int level)
         else pic_irq0_deassert++;
     } else {
         pic_other_irq++;
+    }
+
+    /* Always log IRQ4 (serial) — no limit */
+    if (irq == 4) {
+        if (level) pic_irq4_assert++;
+        else pic_irq4_deassert++;
+        fprintf(stderr, "SERIAL_IRQ4: %s #%ld (total assert=%ld deassert=%ld)\n",
+                level ? "ASSERT" : "deassert",
+                level ? pic_irq4_assert : pic_irq4_deassert,
+                pic_irq4_assert, pic_irq4_deassert);
+        fflush(stderr);
     }
 
     /* Log first few IRQ0 assertions to confirm PIT is firing */
@@ -87,13 +100,25 @@ static void bhyve_pic_set_irq(void *opaque, int irq, int level)
     }
 
     /*
-     * Signal the CPU so it re-enters vm_run. Pre_run will read
-     * bhyve_pic_pending_irqs and inject the correct vector via
-     * vm_lapic_irq().
+     * Inject directly into kernel vLAPIC so sleeping vCPUs wake
+     * immediately.  Also set CPU_INTERRUPT_HARD for pre_run fallback.
      */
     if (level) {
         CPUState *cpu = first_cpu;
         if (cpu) {
+            /* Direct injection: map ISA IRQ to IOAPIC vector and inject.
+             * If IOAPIC not yet programmed (early boot/BIOS), use PIC
+             * vector as fallback so the kernel HLT handler wakes up. */
+            int pic_pin = (irq == 0) ? 2 : irq;
+            int vec = 0;
+            if (pic_pin < 24) {
+                vec = bhyve_ioapic_vectors[pic_pin];
+            }
+            if (vec < 0x10) {
+                /* IOAPIC not configured yet — use PIC vector */
+                vec = (irq < 8) ? (0x20 + irq) : (0x28 + irq - 8);
+            }
+            bhyve_inject_lapic_irq(cpu, vec);
             cpu_interrupt(cpu, CPU_INTERRUPT_HARD);
         }
     }

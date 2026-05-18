@@ -85,10 +85,23 @@ static void bhyve_ioapic_set_irq(void *opaque, int irq, int level)
     }
 
     /*
-     * Wake the vCPU so it re-enters vm_run — pre_run will inject
-     * the interrupt vector via vm_lapic_irq().
+     * Inject directly into kernel vLAPIC so sleeping vCPUs wake
+     * immediately (vm_lapic_irq → vcpu_notify_event → wakeup).
+     * Also set CPU_INTERRUPT_HARD for the pre_run fallback path.
      */
     if (level) {
+        /* Inject directly into kernel vLAPIC for immediate wakeup */
+        if (pin < 24) {
+            uint64_t rte = common->ioredtbl[pin];
+            uint8_t vec = rte & 0xFF;
+            int masked_bit = (rte >> 16) & 1;
+            if (!masked_bit && vec >= 0x10) {
+                CPUState *target = first_cpu;
+                if (target) {
+                    bhyve_inject_lapic_irq(target, vec);
+                }
+            }
+        }
         CPUState *cpu = first_cpu;
         if (cpu) {
             cpu_interrupt(cpu, CPU_INTERRUPT_HARD);

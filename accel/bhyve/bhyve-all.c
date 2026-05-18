@@ -20,6 +20,7 @@
 
 #include "bhyve-accel-ops.h"
 #include "bhyve-internal.h"
+#include "hw/i386/apic_internal.h"
 
 #include <signal.h>
 #include <unistd.h>
@@ -47,30 +48,34 @@ static volatile long exit_other = 0;
 static volatile long exit_pause = 0;
 
 /*
- * LAPIC timer polling mechanism.
+ * LAPIC timer — precise deadline timer for HLT exits.
  *
- * Problem: The kernel's vlapic timer fires via callout and writes the
- * interrupt vector into the vLAPIC IRR. It then calls vcpu_notify_event(),
- * but when the vcpu has returned to userspace (VCPU_FROZEN state), that
- * function does nothing — it only handles VCPU_RUNNING and VCPU_SLEEPING.
- * So QEMU never learns that a LAPIC timer interrupt is pending in the IRR.
+ * When the guest executes HLT, the kernel returns to userspace (retu=true).
+ * We read the kernel's vLAPIC timer state (CCR, DCR, ICR) and compute the
+ * exact time the next LAPIC timer interrupt will fire.  The host timer is
+ * armed for that precise deadline rather than polling at a fixed interval.
  *
- * Fix: When the guest HLTs, we start a 1ms one-shot timer. When it fires,
- * it calls cpu_interrupt(HARD) which wakes the vcpu from halt_cond.
- * The vcpu then re-enters vm_run, and the kernel's vmx_inject_interrupts
- * finds the pending interrupt in IRR and injects it into the guest.
+ * Additionally, on HLT exit we check the kernel LAPIC's IRR — if a timer
+ * interrupt has already fired (set by the kernel callout handler), we skip
+ * the halt entirely and re-enter the VM immediately.
  *
- * If the guest HLTs again (no interrupt was pending), we restart the timer.
- * Effective poll rate: ~1000 Hz, matching Linux's default LAPIC timer freq.
+ * For device interrupts (PIC/IOAPIC), the set_irq handlers call
+ * cpu_interrupt(CPU_INTERRUPT_HARD) which wakes the halted vCPU thread
+ * instantly, independent of this timer.
  */
-static QEMUTimer *lapic_poll_timer;
-static CPUState *lapic_poll_cpu;
-
+#define VLAPIC_BUS_FREQ (128 * 1024 * 1024)
 static void lapic_poll_timer_cb(void *opaque)
 {
     CPUState *cpu = (CPUState *)opaque;
-    if (cpu && cpu->halted) {
-        cpu_interrupt(cpu, CPU_INTERRUPT_HARD);
+    if (cpu) {
+        if (cpu->halted) {
+            cpu_interrupt(cpu, CPU_INTERRUPT_HARD);
+        } else {
+            /* Non-halted CPU: force vm_run exit so kernel can
+             * inject pending LAPIC interrupts (e.g. during AP init) */
+            cpu->exit_request = 1;
+            qemu_cpu_kick(cpu);
+        }
     }
 }
 
@@ -106,12 +111,21 @@ static void mmio_print_stats(void) {
     fflush(stderr);
 }
 
-#define VM_NAME "vm1"
+#define VM_NAME "vm2"
 
 /* From machine/vmm.h - interrupt injection info */
 #ifndef VM_INTINFO_VALID
 #define VM_INTINFO_VALID    0x80000000
 #define VM_INTINFO_HWINTR   (0 << 8)
+#endif
+
+/* From x86/apicreg.h - APIC delivery modes for IPI handling */
+#ifndef APIC_DELMODE_FIXED
+#define APIC_DELMODE_FIXED      0x00000000
+#define APIC_DELMODE_LOWPRIO    0x00000100
+#define APIC_DELMODE_NMI        0x00000400
+#define APIC_DELMODE_INIT       0x00000500
+#define APIC_DELMODE_STARTUP    0x00000600
 #endif
 
 struct AccelCPUState {
@@ -120,6 +134,14 @@ struct AccelCPUState {
 
     /* QEMU State =/= VMM state */
     bool dirty;
+
+    /* True after INIT, cleared on first SIPI.  Prevents duplicate
+     * SIPIs (INIT-SIPI-SIPI protocol) from resetting an already-
+     * running AP back to real mode. */
+    bool wait_for_sipi;
+
+    /* Per-vCPU LAPIC poll timer for waking halted vCPUs */
+    QEMUTimer *lapic_poll_timer;
 };
 
 /* -------------------------------------------------------------------------- */
@@ -129,6 +151,19 @@ static bool bhyve_allowed;
 int
 bhyve_enabled(void) {
     return bhyve_allowed;
+}
+
+/*
+ * Inject a vector into a vCPU's kernel vLAPIC.  Called by PIC/IOAPIC
+ * set_irq handlers to wake vCPUs sleeping in the kernel HLT handler.
+ * vm_lapic_irq() sets the IRR bit and calls vcpu_notify_event(),
+ * which wakes a VCPU_SLEEPING vCPU via wakeup_one().
+ */
+void bhyve_inject_lapic_irq(CPUState *cpu, int vector)
+{
+    if (cpu && cpu->accel && cpu->accel->vcpu) {
+        vm_lapic_irq(cpu->accel->vcpu, vector);
+    }
 }
 
 static enum host_vendor get_cpu_vendor(void) {
@@ -262,6 +297,58 @@ vmm_get_segment(struct vcpu *vcpu, int reg, const SegmentCache *qseg)
 }
 */
 
+/* Debug version: logs which register fails */
+static void vmm_set_registers_debug(CPUState *cpu) {
+    CPUX86State *env = cpu_env(cpu);
+    AccelCPUState *qcpu = cpu->accel;
+    struct vcpu* vcpu = qcpu->vcpu;
+    int ret;
+#define TRY_SET(name, reg, val) do { \
+    ret = vm_set_register(vcpu, (reg), (val)); \
+    if (ret != 0) fprintf(stderr, "  SET_REG FAIL: %s = 0x%lx err=%d errno=%d\n", \
+                          name, (unsigned long)(val), ret, errno); \
+} while(0)
+    TRY_SET("RAX", VM_REG_GUEST_RAX, env->regs[R_EAX]);
+    TRY_SET("RIP", VM_REG_GUEST_RIP, env->eip);
+    TRY_SET("RFLAGS", VM_REG_GUEST_RFLAGS, env->eflags);
+    TRY_SET("CR0", VM_REG_GUEST_CR0, env->cr[0]);
+    TRY_SET("CR3", VM_REG_GUEST_CR3, env->cr[3]);
+    TRY_SET("CR4", VM_REG_GUEST_CR4, env->cr[4]);
+    TRY_SET("EFER", VM_REG_GUEST_EFER, env->efer);
+    TRY_SET("DR7", VM_REG_GUEST_DR7, env->dr[7]);
+    fprintf(stderr, "  vmm_set_registers_debug: eip=0x%lx cr0=0x%lx cr4=0x%lx efer=0x%lx eflags=0x%lx\n",
+            (unsigned long)env->eip, (unsigned long)env->cr[0],
+            (unsigned long)env->cr[4], (unsigned long)env->efer,
+            (unsigned long)env->eflags);
+    /* Try segments */
+    {
+        struct { int reg; int qemu_idx; const char *name; } segs[] = {
+            { VM_REG_GUEST_CS, R_CS, "CS" },
+            { VM_REG_GUEST_DS, R_DS, "DS" },
+            { VM_REG_GUEST_SS, R_SS, "SS" },
+        };
+        for (int i = 0; i < 3; i++) {
+            ret = vm_set_register(vcpu, segs[i].reg, env->segs[segs[i].qemu_idx].selector);
+            if (ret != 0) fprintf(stderr, "  SET_REG FAIL: %s selector err=%d\n", segs[i].name, ret);
+            /* Try setting desc */
+            uint32_t _f = env->segs[segs[i].qemu_idx].flags;
+            uint32_t _lo = (_f >> 8) & 0xFF;
+            uint32_t _l  = (_f >> 21) & 1;
+            uint32_t _db = (_f >> 22) & 1;
+            uint32_t _g  = (_f >> 23) & 1;
+            uint32_t _ar = _lo | (_l << 13) | (_db << 14) | (_g << 15);
+            if (!(_ar & 0x80)) _ar |= (1 << 16);
+            ret = vm_set_desc(vcpu, segs[i].reg,
+                              env->segs[segs[i].qemu_idx].base,
+                              env->segs[segs[i].qemu_idx].limit, _ar);
+            if (ret != 0) fprintf(stderr, "  SET_DESC FAIL: %s base=0x%lx limit=0x%x ar=0x%x flags=0x%x err=%d errno=%d\n",
+                                  segs[i].name, (unsigned long)env->segs[segs[i].qemu_idx].base,
+                                  (unsigned)env->segs[segs[i].qemu_idx].limit, _ar, _f, ret, errno);
+        }
+    }
+#undef TRY_SET
+}
+
 static int vmm_set_registers(CPUState *cpu) {
     CPUX86State *env = cpu_env(cpu);
     AccelCPUState *qcpu = cpu->accel;
@@ -269,48 +356,54 @@ static int vmm_set_registers(CPUState *cpu) {
 
     /* GPRs */
     int ret;
+    static int set_reg_debug = 1; /* enable for first failure */
+
+    int any_fail = 0;
+#define VM_SET_REG_CHECK(name, reg, val) do { \
+    ret = vm_set_register(vcpu, (reg), (val)); \
+    if (ret != 0) { \
+        if (set_reg_debug) { \
+            fprintf(stderr, "vmm_set_registers: FAIL at %s reg=%d val=0x%lx err=%d errno=%d\n", \
+                    name, (reg), (unsigned long)(val), ret, errno); \
+        } \
+        any_fail = ret; \
+    } \
+} while(0)
+
+#define VM_SET_DESC_CHECK(name, reg, base, limit, ar) do { \
+    ret = vm_set_desc(vcpu, (reg), (base), (limit), (ar)); \
+    if (ret != 0) { \
+        if (set_reg_debug) { \
+            fprintf(stderr, "vmm_set_desc: FAIL at %s base=0x%lx limit=0x%x ar=0x%x err=%d errno=%d\n", \
+                    name, (unsigned long)(base), (unsigned)(limit), (unsigned)(ar), ret, errno); \
+        } \
+        any_fail = ret; \
+    } \
+} while(0)
 
     // General-Purpose Registers
-    ret = vm_set_register(vcpu, VM_REG_GUEST_RAX, env->regs[R_EAX]);
-    if (ret != 0) return ret;
-    ret = vm_set_register(vcpu, VM_REG_GUEST_RBX, env->regs[R_EBX]);
-    if (ret != 0) return ret;
-    ret = vm_set_register(vcpu, VM_REG_GUEST_RCX, env->regs[R_ECX]);
-    if (ret != 0) return ret;
-    ret = vm_set_register(vcpu, VM_REG_GUEST_RDX, env->regs[R_EDX]);
-    if (ret != 0) return ret;
-    ret = vm_set_register(vcpu, VM_REG_GUEST_RSI, env->regs[R_ESI]);
-    if (ret != 0) return ret;
-    ret = vm_set_register(vcpu, VM_REG_GUEST_RDI, env->regs[R_EDI]);
-    if (ret != 0) return ret;
-    ret = vm_set_register(vcpu, VM_REG_GUEST_RBP, env->regs[R_EBP]);
-    if (ret != 0) return ret;
-    ret = vm_set_register(vcpu, VM_REG_GUEST_RSP, env->regs[R_ESP]);
-    if (ret != 0) return ret;
+    VM_SET_REG_CHECK("RAX", VM_REG_GUEST_RAX, env->regs[R_EAX]);
+    VM_SET_REG_CHECK("RBX", VM_REG_GUEST_RBX, env->regs[R_EBX]);
+    VM_SET_REG_CHECK("RCX", VM_REG_GUEST_RCX, env->regs[R_ECX]);
+    VM_SET_REG_CHECK("RDX", VM_REG_GUEST_RDX, env->regs[R_EDX]);
+    VM_SET_REG_CHECK("RSI", VM_REG_GUEST_RSI, env->regs[R_ESI]);
+    VM_SET_REG_CHECK("RDI", VM_REG_GUEST_RDI, env->regs[R_EDI]);
+    VM_SET_REG_CHECK("RBP", VM_REG_GUEST_RBP, env->regs[R_EBP]);
+    VM_SET_REG_CHECK("RSP", VM_REG_GUEST_RSP, env->regs[R_ESP]);
 #ifdef TARGET_X86_64
-    ret = vm_set_register(vcpu, VM_REG_GUEST_R8, env->regs[R_R8]);
-    if (ret != 0) return ret;
-    ret = vm_set_register(vcpu, VM_REG_GUEST_R9, env->regs[R_R9]);
-    if (ret != 0) return ret;
-    ret = vm_set_register(vcpu, VM_REG_GUEST_R10, env->regs[R_R10]);
-    if (ret != 0) return ret;
-    ret = vm_set_register(vcpu, VM_REG_GUEST_R11, env->regs[R_R11]);
-    if (ret != 0) return ret;
-    ret = vm_set_register(vcpu, VM_REG_GUEST_R12, env->regs[R_R12]);
-    if (ret != 0) return ret;
-    ret = vm_set_register(vcpu, VM_REG_GUEST_R13, env->regs[R_R13]);
-    if (ret != 0) return ret;
-    ret = vm_set_register(vcpu, VM_REG_GUEST_R14, env->regs[R_R14]);
-    if (ret != 0) return ret;
-    ret = vm_set_register(vcpu, VM_REG_GUEST_R15, env->regs[R_R15]);
-    if (ret != 0) return ret;
+    VM_SET_REG_CHECK("R8", VM_REG_GUEST_R8, env->regs[R_R8]);
+    VM_SET_REG_CHECK("R9", VM_REG_GUEST_R9, env->regs[R_R9]);
+    VM_SET_REG_CHECK("R10", VM_REG_GUEST_R10, env->regs[R_R10]);
+    VM_SET_REG_CHECK("R11", VM_REG_GUEST_R11, env->regs[R_R11]);
+    VM_SET_REG_CHECK("R12", VM_REG_GUEST_R12, env->regs[R_R12]);
+    VM_SET_REG_CHECK("R13", VM_REG_GUEST_R13, env->regs[R_R13]);
+    VM_SET_REG_CHECK("R14", VM_REG_GUEST_R14, env->regs[R_R14]);
+    VM_SET_REG_CHECK("R15", VM_REG_GUEST_R15, env->regs[R_R15]);
 #endif
 
     // RIP and RFLAGS
-    ret = vm_set_register(vcpu, VM_REG_GUEST_RIP, env->eip);
-    if (ret != 0) return ret;
-    ret = vm_set_register(vcpu, VM_REG_GUEST_RFLAGS, env->eflags);
-    if (ret != 0) return ret;
+    VM_SET_REG_CHECK("RIP", VM_REG_GUEST_RIP, env->eip);
+    VM_SET_REG_CHECK("RFLAGS", VM_REG_GUEST_RFLAGS, env->eflags);
 
     /*
      * Segment Registers — full descriptors (selector + base + limit + access).
@@ -337,34 +430,30 @@ static int vmm_set_registers(CPUState *cpu) {
 })
 
     {
-        struct { int reg; int qemu_idx; } segs[] = {
-            { VM_REG_GUEST_CS, R_CS },
-            { VM_REG_GUEST_DS, R_DS },
-            { VM_REG_GUEST_ES, R_ES },
-            { VM_REG_GUEST_SS, R_SS },
-            { VM_REG_GUEST_FS, R_FS },
-            { VM_REG_GUEST_GS, R_GS },
+        struct { int reg; int qemu_idx; const char *name; } segs[] = {
+            { VM_REG_GUEST_CS, R_CS, "CS" },
+            { VM_REG_GUEST_DS, R_DS, "DS" },
+            { VM_REG_GUEST_ES, R_ES, "ES" },
+            { VM_REG_GUEST_SS, R_SS, "SS" },
+            { VM_REG_GUEST_FS, R_FS, "FS" },
+            { VM_REG_GUEST_GS, R_GS, "GS" },
         };
         for (int i = 0; i < 6; i++) {
             uint32_t vmx_ar = QEMU_FLAGS_TO_VMX_AR(env->segs[segs[i].qemu_idx].flags);
-            ret = vm_set_register(vcpu, segs[i].reg,
-                                  env->segs[segs[i].qemu_idx].selector);
-            if (ret != 0) return ret;
-            ret = vm_set_desc(vcpu, segs[i].reg,
+            VM_SET_REG_CHECK(segs[i].name, segs[i].reg,
+                              env->segs[segs[i].qemu_idx].selector);
+            VM_SET_DESC_CHECK(segs[i].name, segs[i].reg,
                               env->segs[segs[i].qemu_idx].base,
                               env->segs[segs[i].qemu_idx].limit,
                               vmx_ar);
-            if (ret != 0) return ret;
         }
     }
     // LDTR
     {
         uint32_t vmx_ar = QEMU_FLAGS_TO_VMX_AR(env->ldt.flags);
-        ret = vm_set_register(vcpu, VM_REG_GUEST_LDTR, env->ldt.selector);
-        if (ret != 0) return ret;
-        ret = vm_set_desc(vcpu, VM_REG_GUEST_LDTR,
+        VM_SET_REG_CHECK("LDTR", VM_REG_GUEST_LDTR, env->ldt.selector);
+        VM_SET_DESC_CHECK("LDTR", VM_REG_GUEST_LDTR,
                           env->ldt.base, env->ldt.limit, vmx_ar);
-        if (ret != 0) return ret;
     }
     // TR — must not be unusable, force P=1
     {
@@ -372,61 +461,52 @@ static int vmm_set_registers(CPUState *cpu) {
         vmx_ar &= ~(1 << 16); /* TR must never be unusable */
         if (!(vmx_ar & 0x80)) vmx_ar |= 0x80; /* force P=1 */
         if (!(vmx_ar & 0x0F)) vmx_ar |= 0x0B; /* force type=busy 32-bit TSS */
-        ret = vm_set_register(vcpu, VM_REG_GUEST_TR, env->tr.selector);
-        if (ret != 0) return ret;
-        ret = vm_set_desc(vcpu, VM_REG_GUEST_TR,
+        VM_SET_REG_CHECK("TR", VM_REG_GUEST_TR, env->tr.selector);
+        VM_SET_DESC_CHECK("TR", VM_REG_GUEST_TR,
                           env->tr.base,
                           env->tr.limit >= 0x67 ? env->tr.limit : 0x67,
                           vmx_ar);
-        if (ret != 0) return ret;
     }
 #undef QEMU_FLAGS_TO_VMX_AR
 
-    // Descriptor Table Registers (Base AND Limit via vm_set_desc)
-    ret = vm_set_desc(vcpu, VM_REG_GUEST_GDTR, env->gdt.base, env->gdt.limit, 0);
-    if (ret != 0) return ret;
-    ret = vm_set_desc(vcpu, VM_REG_GUEST_IDTR, env->idt.base, env->idt.limit, 0);
-    if (ret != 0) return ret;
+    // Descriptor Table Registers
+    VM_SET_DESC_CHECK("GDTR", VM_REG_GUEST_GDTR, env->gdt.base, env->gdt.limit, 0);
+    VM_SET_DESC_CHECK("IDTR", VM_REG_GUEST_IDTR, env->idt.base, env->idt.limit, 0);
 
     // Control Registers
-    ret = vm_set_register(vcpu, VM_REG_GUEST_CR0, env->cr[0]);
-    if (ret != 0) return ret;
-    ret = vm_set_register(vcpu, VM_REG_GUEST_CR2, env->cr[2]);
-    if (ret != 0) return ret;
-    ret = vm_set_register(vcpu, VM_REG_GUEST_CR3, env->cr[3]);
-    if (ret != 0) return ret;
-    ret = vm_set_register(vcpu, VM_REG_GUEST_CR4, env->cr[4]);
-    if (ret != 0) return ret;
-    ret = vm_set_register(vcpu, VM_REG_GUEST_TPR, qcpu->tpr);
-    if (ret != 0) return ret;
+    VM_SET_REG_CHECK("CR0", VM_REG_GUEST_CR0, env->cr[0]);
+    VM_SET_REG_CHECK("CR2", VM_REG_GUEST_CR2, env->cr[2]);
+    VM_SET_REG_CHECK("CR3", VM_REG_GUEST_CR3, env->cr[3]);
+    VM_SET_REG_CHECK("CR4", VM_REG_GUEST_CR4, env->cr[4]);
+    /*
+     * Skip TPR: vmx_setreg has no special case for TPR (unlike vmx_getreg
+     * which calls vlapic_get_cr8). The kernel's vlapic manages TPR
+     * independently, and vm_set_register(TPR) returns EINVAL.
+     */
 
     // Debug Registers
-    ret = vm_set_register(vcpu, VM_REG_GUEST_DR0, env->dr[0]);
-    if (ret != 0) return ret;
-    ret = vm_set_register(vcpu, VM_REG_GUEST_DR1, env->dr[1]);
-    if (ret != 0) return ret;
-    ret = vm_set_register(vcpu, VM_REG_GUEST_DR2, env->dr[2]);
-    if (ret != 0) return ret;
-    ret = vm_set_register(vcpu, VM_REG_GUEST_DR3, env->dr[3]);
-    if (ret != 0) return ret;
-    ret = vm_set_register(vcpu, VM_REG_GUEST_DR6, env->dr[6]);
-    if (ret != 0) return ret;
-    ret = vm_set_register(vcpu, VM_REG_GUEST_DR7, env->dr[7]);
-    if (ret != 0) return ret;
+    VM_SET_REG_CHECK("DR0", VM_REG_GUEST_DR0, env->dr[0]);
+    VM_SET_REG_CHECK("DR1", VM_REG_GUEST_DR1, env->dr[1]);
+    VM_SET_REG_CHECK("DR2", VM_REG_GUEST_DR2, env->dr[2]);
+    VM_SET_REG_CHECK("DR3", VM_REG_GUEST_DR3, env->dr[3]);
+    VM_SET_REG_CHECK("DR6", VM_REG_GUEST_DR6, env->dr[6]);
+    VM_SET_REG_CHECK("DR7", VM_REG_GUEST_DR7, env->dr[7]);
 
     // MSRs
-    ret = vm_set_register(vcpu, VM_REG_GUEST_EFER, env->efer);
-    if (ret != 0) return ret;
+    VM_SET_REG_CHECK("EFER", VM_REG_GUEST_EFER, env->efer);
 #ifdef TARGET_X86_64
-    ret = vm_set_register(vcpu, VM_REG_GUEST_FS_BASE, env->segs[R_FS].base);
-    if (ret != 0) return ret;
-    ret = vm_set_register(vcpu, VM_REG_GUEST_GS_BASE, env->segs[R_GS].base);
-    if (ret != 0) return ret;
-    ret = vm_set_register(vcpu, VM_REG_GUEST_KGS_BASE, env->kernelgsbase);
-    if (ret != 0) return ret;
+    VM_SET_REG_CHECK("FS_BASE", VM_REG_GUEST_FS_BASE, env->segs[R_FS].base);
+    VM_SET_REG_CHECK("GS_BASE", VM_REG_GUEST_GS_BASE, env->segs[R_GS].base);
+    VM_SET_REG_CHECK("KGS_BASE", VM_REG_GUEST_KGS_BASE, env->kernelgsbase);
 #endif
 
-    return 0; // Success
+#undef VM_SET_REG_CHECK
+#undef VM_SET_DESC_CHECK
+    if (any_fail && set_reg_debug) {
+        set_reg_debug = 0; /* only log once */
+    }
+    return 0; /* Continue even if some registers fail (TPR, KGS_BASE etc.
+               * are kernel-managed and vmx_setreg doesn't support SET) */
 }
 
 static int vmm_get_registers(CPUState *cpu) {
@@ -1118,8 +1198,96 @@ static int bhyve_vcpu_run(CPUState *cpu) {
 	vmrun.cpusetsize = sizeof(dmask);
 
     if (cpu->interrupt_request & CPU_INTERRUPT_INIT) {
+        fprintf(stderr, "INIT[%d]: processing, irq_req=0x%x apic=%p\n",
+                cpu->cpu_index, cpu->interrupt_request,
+                (void *)x86_cpu->apic_state);
         bhyve_cpu_synchronize_state(cpu);
         do_cpu_init(x86_cpu);
+        qcpu->wait_for_sipi = true;  /* Accept next SIPI, reject duplicates */
+        fprintf(stderr, "INIT[%d]: after do_cpu_init, wait_for_sipi=%d bsp=%d apicbase=0x%lx\n",
+                cpu->cpu_index,
+                x86_cpu->apic_state ? x86_cpu->apic_state->wait_for_sipi : -1,
+                x86_cpu->apic_state ? cpu_is_bsp(x86_cpu) : -1,
+                x86_cpu->apic_state ? (unsigned long)cpu_get_apic_base(x86_cpu->apic_state) : 0);
+        /* After cpu_reset, QEMU state is definitive. Write it to
+         * kernel VMCS so subsequent reads won't get stale data. */
+        vmm_set_registers(cpu);
+        qcpu->dirty = false;
+
+        /*
+         * Reset the kernel vLAPIC state to clear stale IRR/ISR bits.
+         * do_cpu_init() only resets QEMU's APIC state — the kernel's
+         * vLAPIC retains pending interrupts from before INIT.  If we
+         * don't clear them, VMX will see pending IRR bits, try to
+         * inject with IF=0 (AP in real mode), set interrupt-window
+         * exiting, and loop on BOGUS exits forever.
+         */
+        {
+            struct vm_lapic_state lapic_state;
+            int lapic_err;
+
+            /* Read current kernel LAPIC state */
+            lapic_err = vm_lapic_get_state(qcpu->vcpu, &lapic_state);
+            if (lapic_err == 0) {
+                fprintf(stderr, "INIT[%d]: APIC ID field[2] BEFORE reset: 0x%08x (expected cpu_index=%d → 0x%08x)\n",
+                        cpu->cpu_index,
+                        lapic_state.fields[2].data,
+                        cpu->cpu_index,
+                        (uint32_t)(cpu->cpu_index << 24));
+
+                /* Zero out IRR (Interrupt Request Register) — indices 0x20..0x27 */
+                for (int i = 0x20; i <= 0x27; i++)
+                    lapic_state.fields[i].data = 0;
+                /* Zero out ISR (In-Service Register) — indices 0x10..0x17 */
+                for (int i = 0x10; i <= 0x17; i++)
+                    lapic_state.fields[i].data = 0;
+                /* Zero out TMR (Trigger Mode Register) — indices 0x18..0x1f */
+                for (int i = 0x18; i <= 0x1f; i++)
+                    lapic_state.fields[i].data = 0;
+                /* Reset DFR to all-ones (flat model) per Intel INIT spec */
+                lapic_state.fields[0xe].data = 0xffffffff;
+                /* Reset SVR — mask all, spurious vector 0xff */
+                lapic_state.fields[0xf].data = 0xff;
+                /* Zero TPR, PPR, LDR */
+                lapic_state.fields[0x8].data = 0;  /* TPR */
+                lapic_state.fields[0xa].data = 0;  /* PPR */
+                lapic_state.fields[0xd].data = 0;  /* LDR */
+                /* Mask all LVT entries (bit 16 = masked) */
+                lapic_state.fields[0x32].data = 0x00010000; /* LVT_TIMER */
+                lapic_state.fields[0x33].data = 0x00010000; /* LVT_THERMAL */
+                lapic_state.fields[0x34].data = 0x00010000; /* LVT_PCINT */
+                lapic_state.fields[0x35].data = 0x00010000; /* LVT_LINT0 */
+                lapic_state.fields[0x36].data = 0x00010000; /* LVT_LINT1 */
+                lapic_state.fields[0x37].data = 0x00010000; /* LVT_ERROR */
+                lapic_state.fields[0x2f].data = 0x00010000; /* LVT_CMCI */
+
+                /*
+                 * Explicitly set the APIC ID to match the CPU index.
+                 * xAPIC format: APIC ID in bits 31:24 of the APIC ID register.
+                 * LAPIC offset 0x020 = fields[2].
+                 * Without this, the kernel vLAPIC may have APIC ID 0 for all
+                 * CPUs after INIT, causing Linux to log "APIC ID mismatch"
+                 * and fail cpuhp synchronization.
+                 */
+                lapic_state.fields[2].data = (uint32_t)(cpu->cpu_index << 24);
+
+                fprintf(stderr, "INIT[%d]: APIC ID field[2] AFTER fix: 0x%08x\n",
+                        cpu->cpu_index, lapic_state.fields[2].data);
+
+                lapic_err = vm_lapic_set_state(qcpu->vcpu, &lapic_state);
+                fprintf(stderr, "INIT[%d]: kernel vLAPIC reset: %s\n",
+                        cpu->cpu_index,
+                        lapic_err == 0 ? "OK" : "FAILED");
+            } else {
+                fprintf(stderr, "INIT[%d]: vm_lapic_get_state failed: %d\n",
+                        cpu->cpu_index, lapic_err);
+            }
+        }
+
+        fprintf(stderr, "INIT[%d]: after vmm_set_registers, wait_for_sipi=%d irq_req=0x%x\n",
+                cpu->cpu_index,
+                x86_cpu->apic_state ? x86_cpu->apic_state->wait_for_sipi : -1,
+                cpu->interrupt_request);
     }
     if (cpu->interrupt_request & CPU_INTERRUPT_POLL) {
         cpu->interrupt_request &= ~CPU_INTERRUPT_POLL;
@@ -1131,8 +1299,63 @@ static int bhyve_vcpu_run(CPUState *cpu) {
         cpu->halted = false;
     }
     if (cpu->interrupt_request & CPU_INTERRUPT_SIPI) {
-        bhyve_cpu_synchronize_state(cpu);
-        do_cpu_sipi(x86_cpu);
+        cpu->interrupt_request &= ~CPU_INTERRUPT_SIPI;
+        /*
+         * SIPI: set CS:RIP directly. The bhyve kernel already handled
+         * the APIC-level INIT/SIPI protocol. QEMU's apic_sipi() relies
+         * on wait_for_sipi being set, but cpu_reset doesn't always
+         * propagate to the APIC device properly with bhyve accel.
+         * Handle it directly: load CS to SIPI vector, RIP=0.
+         *
+         * Per Intel SDM: SIPI is only accepted in "wait-for-SIPI" state.
+         * A second SIPI (standard INIT-SIPI-SIPI sequence) arriving after
+         * the AP has already started running must be ignored.  Without
+         * this guard, the duplicate SIPI resets CS:RIP back to the
+         * trampoline while the AP is in 64-bit mode, causing corruption.
+         */
+        if (!qcpu->wait_for_sipi) {
+            fprintf(stderr, "SIPI[%d]: IGNORED (AP already running, not in wait-for-SIPI state)\n",
+                    cpu->cpu_index);
+            goto sipi_done;
+        }
+        qcpu->wait_for_sipi = false;  /* First SIPI accepted; reject further */
+        {
+            uint8_t sipi_vec = x86_cpu->apic_state ?
+                               x86_cpu->apic_state->sipi_vector : 0;
+            cpu_x86_load_seg_cache_sipi(x86_cpu, sipi_vec);
+            /*
+             * Mark dirty so vmm_set_registers pushes the new CS:RIP
+             * to the kernel VMCS. Without this, the INIT handler's
+             * vmm_set_registers + dirty=false leaves stale reset-state
+             * CS:RIP in the kernel, and the AP enters vm_run at the
+             * BIOS reset vector instead of the SIPI trampoline.
+             */
+            qcpu->dirty = true;
+            /*
+             * CRITICAL: clear halted so the AP actually enters vm_run.
+             * do_cpu_init() sets halted=true for non-BSP CPUs (wait-for-
+             * SIPI state).  Now that SIPI has arrived, the AP must run.
+             * Without this, bhyve_vcpu_run returns EXCP_HLT immediately
+             * and the AP never executes guest code.
+             */
+            cpu->halted = false;
+            fprintf(stderr, "SIPI[%d]: direct, vec=%d eip=0x%lx cs_base=0x%lx cs_sel=0x%x dirty=true halted=false\n",
+                    cpu->cpu_index, sipi_vec,
+                    (unsigned long)env->eip,
+                    (unsigned long)env->segs[R_CS].base,
+                    (unsigned)env->segs[R_CS].selector);
+
+            /* Start LAPIC poll timer for AP — same as BSP's HLT timer.
+             * The AP needs periodic vm_run exits during init so the
+             * kernel can inject pending LAPIC interrupts. */
+            if (!qcpu->lapic_poll_timer) {
+                qcpu->lapic_poll_timer = timer_new_ns(QEMU_CLOCK_REALTIME,
+                                                      lapic_poll_timer_cb, cpu);
+            }
+            timer_mod_ns(qcpu->lapic_poll_timer,
+                         qemu_clock_get_ns(QEMU_CLOCK_REALTIME) + 10000000);
+        }
+    sipi_done: ;
     }
 
     if (cpu->interrupt_request & CPU_INTERRUPT_TPR) {
@@ -1142,6 +1365,17 @@ static int bhyve_vcpu_run(CPUState *cpu) {
                                       env->tpr_access_type);
     }
 
+    /*
+     * After INIT processing, non-BSP CPUs are halted (wait-for-SIPI).
+     * Return to the thread loop where qemu_process_cpu_events blocks
+     * on halt_cond until SIPI arrives via cpu_interrupt.
+     */
+    if (cpu->halted) {
+        bql_unlock();
+        cpu->exception_index = EXCP_HLT;
+        return EXCP_HLT;
+    }
+
     bql_unlock();
     cpu_exec_start(cpu);
 
@@ -1149,6 +1383,56 @@ static int bhyve_vcpu_run(CPUState *cpu) {
         if (qcpu->dirty) {
             vmm_set_registers(cpu);
             qcpu->dirty = false;
+            /* Log AP's first entry registers from kernel VMCS */
+            if (cpu->cpu_index > 0) {
+                static int ap_entry_log = 0;
+                if (ap_entry_log < 2) {
+                    uint64_t rip_k, cs_sel_k;
+                    uint64_t cs_base_k;
+                    uint32_t cs_limit_k, cs_ar_k;
+                    vm_get_register(qcpu->vcpu, VM_REG_GUEST_RIP, &rip_k);
+                    vm_get_register(qcpu->vcpu, VM_REG_GUEST_CS, &cs_sel_k);
+                    vm_get_desc(qcpu->vcpu, VM_REG_GUEST_CS, &cs_base_k, &cs_limit_k, &cs_ar_k);
+                    fprintf(stderr, "AP[%d] VMCS after set_registers: RIP=0x%lx CS=0x%lx base=0x%lx limit=0x%x ar=0x%x\n",
+                            cpu->cpu_index, (unsigned long)rip_k, (unsigned long)cs_sel_k,
+                            (unsigned long)cs_base_k, cs_limit_k, cs_ar_k);
+                    /* Also log CR0 to verify real mode */
+                    uint64_t cr0_k;
+                    vm_get_register(qcpu->vcpu, VM_REG_GUEST_CR0, &cr0_k);
+                    fprintf(stderr, "AP[%d] VMCS: CR0=0x%lx\n", cpu->cpu_index, (unsigned long)cr0_k);
+                    /* Dump guest physical memory via BOTH QEMU address_space and bhyve mmap */
+                    {
+                        hwaddr phys_addr = cs_base_k + rip_k;
+                        uint8_t code[64];
+                        MemTxResult mtr = address_space_read(
+                            &address_space_memory, phys_addr,
+                            MEMTXATTRS_UNSPECIFIED, code, sizeof(code));
+                        if (mtr == MEMTX_OK) {
+                            fprintf(stderr, "AP[%d] QEMU address_space at 0x%lx:", cpu->cpu_index, (unsigned long)phys_addr);
+                            for (int ci = 0; ci < 32; ci++) {
+                                if (ci % 16 == 0) fprintf(stderr, "\n  %04x:", ci);
+                                fprintf(stderr, " %02x", code[ci]);
+                            }
+                            fprintf(stderr, "\n");
+                        }
+                        /* Also read from bhyve's mmap'd guest memory */
+                        {
+                            char *baseaddr;
+                            struct bhyve_machine *mach_tmp = get_bhyve_mach();
+                            if (vm_get_guestmem_from_ctx(mach_tmp->vm, &baseaddr, NULL, NULL) == 0) {
+                                uint8_t *bhyve_mem = (uint8_t *)(baseaddr + phys_addr);
+                                fprintf(stderr, "AP[%d] BHYVE mmap at 0x%lx:", cpu->cpu_index, (unsigned long)phys_addr);
+                                for (int ci = 0; ci < 32; ci++) {
+                                    if (ci % 16 == 0) fprintf(stderr, "\n  %04x:", ci);
+                                    fprintf(stderr, " %02x", bhyve_mem[ci]);
+                                }
+                                fprintf(stderr, "\n");
+                            }
+                        }
+                    }
+                    ap_entry_log++;
+                }
+            }
         }
 
         bhyve_vcpu_pre_run(cpu);
@@ -1217,11 +1501,83 @@ static int bhyve_vcpu_run(CPUState *cpu) {
                 pre_run_debug = 0;
             }
         }
+
+        /*
+         * Second dirty check: bhyve_vcpu_pre_run may have processed
+         * INIT+SIPI which modifies env (CS:RIP, CR0, etc.) and sets
+         * dirty=true.  Without this, vm_run enters with stale VMCS
+         * state (e.g. reset-vector RIP instead of SIPI trampoline).
+         */
+        if (qcpu->dirty) {
+            vmm_set_registers(cpu);
+            qcpu->dirty = false;
+        }
+
 		error = vm_run(qcpu->vcpu, &vmrun);
+		{
+		    static int vmrun_log = 0;
+		    static long port402_count = 0;
+		    if (error == 0) {
+		        int interesting = 0;
+		        if (vme.exitcode == VM_EXITCODE_INOUT && vme.u.inout.port == 0x402) {
+		            port402_count++;
+		            /* Log port 0x402 summary every 100K */
+		            if ((port402_count % 100000) == 0) {
+		                fprintf(stderr, "vm_run[%d] #%ld: port 0x402 count=%ld\n",
+		                        cpu->cpu_index, vm_run_total, port402_count);
+		                fflush(stderr);
+		            }
+		        } else if (vme.exitcode == VM_EXITCODE_INOUT) {
+		            if (vmrun_log < 200) {
+		                fprintf(stderr, "vm_run[%d] #%ld: INOUT port=0x%x %s rip=0x%lx\n",
+		                        cpu->cpu_index, vm_run_total,
+		                        vme.u.inout.port,
+		                        vme.u.inout.in ? "IN" : "OUT",
+		                        (unsigned long)vme.rip);
+		                fflush(stderr);
+		                vmrun_log++;
+		            }
+		        } else if (vmrun_log < 200) {
+		            /* Log non-INOUT, non-port402 exits (limited) */
+		            fprintf(stderr, "vm_run[%d] #%ld: exit=%d rip=0x%lx\n",
+		                    cpu->cpu_index, vm_run_total, vme.exitcode,
+		                    (unsigned long)vme.rip);
+		            fflush(stderr);
+		            vmrun_log++;
+		        }
+		    }
+		}
 		vm_run_total++;
-		if ((vm_run_total % 5000000) == 0) {
+		if ((vm_run_total % 1000000) == 0) {
 		    mmio_print_stats();
 		}
+
+        /* Per-CPU periodic stats (every 5 seconds wall clock) */
+        {
+            static __thread long cpu_runs = 0;
+            static __thread long cpu_hlt = 0;
+            static __thread long cpu_inst_emul = 0;
+            static __thread long cpu_inout = 0;
+            static __thread int64_t last_report_ms = 0;
+            cpu_runs++;
+            if (error == 0) {
+                if (vme.exitcode == VM_EXITCODE_HLT) cpu_hlt++;
+                else if (vme.exitcode == VM_EXITCODE_INST_EMUL) cpu_inst_emul++;
+                else if (vme.exitcode == VM_EXITCODE_INOUT ||
+                         vme.exitcode == VM_EXITCODE_INOUT_STR) cpu_inout++;
+            }
+            int64_t now_ms = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+            if (last_report_ms == 0) last_report_ms = now_ms;
+            if (now_ms - last_report_ms >= 5000) {
+                fprintf(stderr, "CPU_STATS[%d] t=%lds: runs=%ld hlt=%ld inst_emul=%ld inout=%ld\n",
+                        cpu->cpu_index,
+                        (long)((now_ms - last_report_ms) / 1000),
+                        cpu_runs, cpu_hlt, cpu_inst_emul, cpu_inout);
+                fflush(stderr);
+                cpu_runs = cpu_hlt = cpu_inst_emul = cpu_inout = 0;
+                last_report_ms = now_ms;
+            }
+        }
 
         if (error != 0) {
             static int vm_run_err_log = 0;
@@ -1244,51 +1600,122 @@ static int bhyve_vcpu_run(CPUState *cpu) {
         switch (exitcode) {
         case VM_EXITCODE_HLT:
             exit_hlt++;
-            /*
-             * Guest executed HLT — waiting for an interrupt.
-             *
-             * Return to QEMU main loop (like KVM does with EXCP_HLT).
-             * The thread loop in bhyve-accel-ops.c calls
-             * qemu_process_cpu_events() which blocks on cpu->halt_cond
-             * while releasing the BQL. This lets the main event loop
-             * advance the virtual clock and run PIT timers.
-             *
-             * When PIT fires → bhyve_pic_set_irq → cpu_interrupt(HARD)
-             * → qemu_cpu_kick → wakes us. The pre-loop interrupt check
-             * clears cpu->halted and we re-enter vm_run.
-             *
-             * LAPIC timer fix: The kernel's vlapic timer fires via
-             * callout and writes to IRR, but vcpu_notify_event does
-             * nothing when vcpu is FROZEN (in userspace). We schedule
-             * a 1ms poll timer that kicks the vcpu so it re-enters
-             * vm_run and the kernel injects the pending interrupt.
-             */
             {
                 static int hlt_log = 0;
-                if (hlt_log < 30) {
-                    int64_t vclk = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-                    fprintf(stderr, "HLT[%d]: rip=0x%lx vclk=%ld irq0=%ld → EXCP_HLT+lapic_poll\n",
-                            hlt_log, (unsigned long)vme.rip,
-                            (long)vclk, pic_irq0_assert);
+
+                /*
+                 * Precise LAPIC timer wakeup for HLT exits.
+                 *
+                 * 1. Read kernel vLAPIC state
+                 * 2. If IRR has pending bits → skip halt, re-enter immediately
+                 * 3. Otherwise compute exact LAPIC timer deadline from CCR/DCR
+                 * 4. Arm host timer for that precise moment
+                 */
+                struct vm_lapic_state hlt_lapic;
+                int hlt_lapic_err = vm_lapic_get_state(qcpu->vcpu, &hlt_lapic);
+                bool irr_pending = false;
+
+                if (hlt_lapic_err == 0) {
+                    /* Check IRR (fields 0x20..0x27) for pending interrupts */
+                    for (int i = 0x20; i <= 0x27; i++) {
+                        if (hlt_lapic.fields[i].data != 0) {
+                            irr_pending = true;
+                            break;
+                        }
+                    }
+                }
+
+                if (irr_pending) {
+                    /* Interrupt already pending — re-enter VM immediately.
+                     * The kernel will inject it on the next VMX entry. */
+                    if (hlt_log < 20) {
+                        fprintf(stderr, "HLT[%d]: IRR pending, skip halt → re-enter\n",
+                                cpu->cpu_index);
+                        fflush(stderr);
+                        hlt_log++;
+                    }
+                    /* Don't set halted — just continue the vm_run loop */
+                    break;
+                }
+
+                /* No pending interrupt. Compute LAPIC timer deadline. */
+                if (hlt_log < 20) {
+                    fprintf(stderr, "HLT[%d]: cpu=%d rip=0x%lx, computing timer deadline\n",
+                            hlt_log, cpu->cpu_index, (unsigned long)vme.rip);
                     fflush(stderr);
                     hlt_log++;
                 }
+
                 cpu->halted = true;
                 cpu->exception_index = EXCP_HLT;
                 rc = EXCP_HLT;
 
-                /*
-                 * Start LAPIC poll timer: fires in 1ms to kick the vcpu.
-                 * This ensures the kernel's vlapic timer interrupt
-                 * (pending in IRR) gets injected on next vm_run entry.
-                 */
-                if (!lapic_poll_timer) {
-                    lapic_poll_timer = timer_new_ms(QEMU_CLOCK_REALTIME,
-                                                   lapic_poll_timer_cb, cpu);
-                    lapic_poll_cpu = cpu;
+                int64_t deadline_ns = -1;
+                if (hlt_lapic_err == 0) {
+                    uint32_t lvt_timer = hlt_lapic.fields[0x32].data;
+                    uint32_t icr = hlt_lapic.fields[0x38].data;
+                    uint32_t ccr = hlt_lapic.fields[0x39].data;
+                    uint32_t dcr = hlt_lapic.fields[0x3E].data;
+                    int masked = (lvt_timer >> 16) & 1;
+
+                    if (!masked && icr > 0 && ccr > 0) {
+                        /* Compute divisor from DCR register (Intel SDM Table 11-10) */
+                        uint32_t divisor;
+                        switch (dcr & 0xB) {
+                        case 0x0B: divisor = 1; break;
+                        case 0x00: divisor = 2; break;
+                        case 0x01: divisor = 4; break;
+                        case 0x02: divisor = 8; break;
+                        case 0x03: divisor = 16; break;
+                        case 0x08: divisor = 32; break;
+                        case 0x09: divisor = 64; break;
+                        case 0x0A: divisor = 128; break;
+                        default:   divisor = 1; break;
+                        }
+
+                        /*
+                         * Time until next LAPIC timer fire:
+                         *   CCR * divisor / VLAPIC_BUS_FREQ  (seconds)
+                         * Convert to nanoseconds:
+                         *   CCR * divisor * 1e9 / (128 * 1024 * 1024)
+                         */
+                        uint64_t ccr64 = ccr;
+                        uint64_t div64 = divisor;
+                        deadline_ns = (int64_t)((ccr64 * div64 * 1000000000ULL)
+                                                / VLAPIC_BUS_FREQ);
+
+                        /* Clamp: minimum 100us to avoid spinning,
+                         * maximum 50ms as sanity cap */
+                        if (deadline_ns < 100000)
+                            deadline_ns = 100000;
+                        if (deadline_ns > 50000000)
+                            deadline_ns = 50000000;
+
+                        static int deadline_log = 0;
+                        if (deadline_log < 20) {
+                            fprintf(stderr, "HLT[%d]: LAPIC timer: ccr=%u icr=%u dcr=0x%x div=%u → %ld ns\n",
+                                    cpu->cpu_index, ccr, icr, dcr, divisor,
+                                    (long)deadline_ns);
+                            fflush(stderr);
+                            deadline_log++;
+                        }
+                    }
                 }
-                timer_mod(lapic_poll_timer,
-                          qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 1);
+
+                if (!qcpu->lapic_poll_timer) {
+                    qcpu->lapic_poll_timer = timer_new_ns(QEMU_CLOCK_REALTIME,
+                                                          lapic_poll_timer_cb, cpu);
+                }
+
+                if (deadline_ns > 0) {
+                    /* Arm for exact LAPIC timer deadline */
+                    timer_mod_ns(qcpu->lapic_poll_timer,
+                                 qemu_clock_get_ns(QEMU_CLOCK_REALTIME) + deadline_ns);
+                } else {
+                    /* No active LAPIC timer — 5ms fallback for device interrupts */
+                    timer_mod_ns(qcpu->lapic_poll_timer,
+                                 qemu_clock_get_ns(QEMU_CLOCK_REALTIME) + 5000000);
+                }
             }
             break;
         case VM_EXITCODE_DEBUG:
@@ -1315,6 +1742,48 @@ static int bhyve_vcpu_run(CPUState *cpu) {
             break;
         case VM_EXITCODE_INST_EMUL:
             bql_lock();
+            {
+                static uint64_t inst_emul_total = 0;
+                static uint64_t inst_emul_lapic = 0;
+                static uint64_t inst_emul_ioapic = 0;
+                static uint64_t inst_emul_hpet = 0;
+                static uint64_t inst_emul_other = 0;
+                static int inst_emul_log = 0;
+                uint64_t gpa_pre = vme.u.inst_emul.gpa;
+
+                inst_emul_total++;
+                if (gpa_pre >= 0xFEE00000ULL && gpa_pre < 0xFEF00000ULL)
+                    inst_emul_lapic++;
+                else if (gpa_pre >= 0xFEC00000ULL && gpa_pre < 0xFED00000ULL)
+                    inst_emul_ioapic++;
+                else if (gpa_pre >= 0xFED00000ULL && gpa_pre < 0xFEE00000ULL)
+                    inst_emul_hpet++;
+                else
+                    inst_emul_other++;
+
+                /* Log first 50 individual accesses */
+                if (inst_emul_log < 50) {
+                    fprintf(stderr, "INST_EMUL[%d]: gpa=0x%lx rip=0x%lx inst[0..3]=%02x %02x %02x %02x\n",
+                            cpu->cpu_index, (unsigned long)gpa_pre,
+                            (unsigned long)vme.rip,
+                            vme.u.inst_emul.vie.inst[0],
+                            vme.u.inst_emul.vie.inst[1],
+                            vme.u.inst_emul.vie.inst[2],
+                            vme.u.inst_emul.vie.inst[3]);
+                    fflush(stderr);
+                    inst_emul_log++;
+                }
+                /* Periodic summary every 10000 exits */
+                if ((inst_emul_total % 10000) == 0) {
+                    fprintf(stderr, "INST_EMUL STATS: total=%lu lapic=%lu ioapic=%lu hpet=%lu other=%lu\n",
+                            (unsigned long)inst_emul_total,
+                            (unsigned long)inst_emul_lapic,
+                            (unsigned long)inst_emul_ioapic,
+                            (unsigned long)inst_emul_hpet,
+                            (unsigned long)inst_emul_other);
+                    fflush(stderr);
+                }
+            }
             rc = vm_assist_qmem(qcpu->vcpu, vmm_mem_callback, &vme);
             if (rc == 0) {
                 mmio_kernel_ok++;
@@ -1330,14 +1799,16 @@ static int bhyve_vcpu_run(CPUState *cpu) {
                 static int mmio_emul_log = 0;
 
                 if (vie->num_valid == 0) {
-                    if (mmio_emul_log < 5) {
-                        fprintf(stderr, "MMIO EMUL: no instruction bytes at "
-                                "gpa=0x%lx rip=0x%lx\n",
+                    if (mmio_emul_log < 10) {
+                        fprintf(stderr, "MMIO EMUL[%d]: no instruction bytes at "
+                                "gpa=0x%lx rip=0x%lx (skipping)\n",
+                                cpu->cpu_index,
                                 (unsigned long)gpa, (unsigned long)vme.rip);
                         mmio_emul_log++;
                     }
                     bql_unlock();
-                    rc = -1;
+                    rc = 0; /* Reset rc (was set by vm_assist_qmem) so
+                             * the while loop continues. */
                     break;
                 }
 
@@ -1607,8 +2078,47 @@ static int bhyve_vcpu_run(CPUState *cpu) {
             }
             break;
         case VM_EXITCODE_BOGUS:
+        case 20: /* VM_EXITCODE_REQIDLE — scheduler yield, just re-enter */
             exit_bogus++;
-            /* Run timers periodically on BOGUS exits too */
+            /* AP diagnostic: log RFLAGS and code at stuck RIP */
+            if (cpu->cpu_index > 0) {
+                static int ap_bogus_log = 0;
+                if (ap_bogus_log < 3) {
+                    uint64_t ap_rflags = 0, ap_rip_k = 0, ap_cr3 = 0, ap_rsp = 0, ap_rdx = 0, ap_rax = 0;
+                    vm_get_register(qcpu->vcpu, VM_REG_GUEST_RFLAGS, &ap_rflags);
+                    vm_get_register(qcpu->vcpu, VM_REG_GUEST_RIP, &ap_rip_k);
+                    vm_get_register(qcpu->vcpu, VM_REG_GUEST_CR3, &ap_cr3);
+                    vm_get_register(qcpu->vcpu, VM_REG_GUEST_RSP, &ap_rsp);
+                    vm_get_register(qcpu->vcpu, VM_REG_GUEST_RDX, &ap_rdx);
+                    vm_get_register(qcpu->vcpu, VM_REG_GUEST_RAX, &ap_rax);
+                    fprintf(stderr, "AP_BOGUS[%d] #%d: rip=0x%lx rflags=0x%lx IF=%d cr3=0x%lx rsp=0x%lx rdx=0x%lx rax=0x%lx\n",
+                            cpu->cpu_index, ap_bogus_log,
+                            (unsigned long)ap_rip_k, (unsigned long)ap_rflags,
+                            (int)((ap_rflags >> 9) & 1),
+                            (unsigned long)ap_cr3, (unsigned long)ap_rsp,
+                            (unsigned long)ap_rdx, (unsigned long)ap_rax);
+                    /* Try to read code at physical address (for kernel with nokaslr:
+                     * virt 0xffffffff81XXXXXX → phys 0x01XXXXXX) */
+                    if (ap_rip_k >= 0xffffffff81000000ULL && ap_rip_k < 0xffffffff82000000ULL) {
+                        uint64_t phys = (ap_rip_k - 0xffffffff80000000ULL) - 16; /* dump 16 bytes before RIP */
+                        char *baseaddr;
+                        struct bhyve_machine *mach_tmp = get_bhyve_mach();
+                        size_t low_sz, high_sz;
+                        if (vm_get_guestmem_from_ctx(mach_tmp->vm, &baseaddr, &low_sz, &high_sz) == 0 && phys < low_sz) {
+                            uint8_t *code = (uint8_t *)(baseaddr + phys);
+                            fprintf(stderr, "AP[%d] code at phys 0x%lx (rip-16):", cpu->cpu_index, (unsigned long)phys);
+                            for (int ci = 0; ci < 48; ci++) {
+                                if (ci % 16 == 0) fprintf(stderr, "\n  %04x:", ci);
+                                fprintf(stderr, " %02x", code[ci]);
+                            }
+                            fprintf(stderr, "\n");
+                        }
+                    }
+                    fflush(stderr);
+                    ap_bogus_log++;
+                }
+            }
+            /* Run timers periodically on BOGUS/REQIDLE exits too */
             if ((exit_bogus % 100) == 0) {
                 bql_lock();
                 qemu_clock_run_timers(QEMU_CLOCK_VIRTUAL);
@@ -1618,6 +2128,30 @@ static int bhyve_vcpu_run(CPUState *cpu) {
                     aio_poll(ctx, false);
                 }
                 bql_unlock();
+            }
+            /* Re-arm timer on BOGUS exits for APs that may need wakeups */
+            if (cpu->cpu_index > 0 && qcpu->lapic_poll_timer) {
+                timer_mod_ns(qcpu->lapic_poll_timer,
+                             qemu_clock_get_ns(QEMU_CLOCK_REALTIME) + 5000000);
+            }
+            /* BSP: periodically read the AP's cpuhp state from guest memory */
+            if (cpu->cpu_index == 0) {
+                static int bsp_cpuhp_log = 0;
+                if (bsp_cpuhp_log < 10) {
+                    /* AP's ap_sync_state at phys 0x3bc213d8 */
+                    char *baseaddr;
+                    struct bhyve_machine *mach_tmp = get_bhyve_mach();
+                    size_t low_sz, high_sz;
+                    if (vm_get_guestmem_from_ctx(mach_tmp->vm, &baseaddr, &low_sz, &high_sz) == 0) {
+                        uint32_t *ap_state = (uint32_t *)(baseaddr + 0x3bc213d8ULL);
+                        if (0x3bc213d8ULL < low_sz) {
+                            fprintf(stderr, "BSP_CPUHP_CHECK: phys 0x3bc213d8 = %d (AP wants 4)\n",
+                                    *ap_state);
+                            fflush(stderr);
+                        }
+                    }
+                    bsp_cpuhp_log++;
+                }
             }
             break;
         case VM_EXITCODE_SUSPENDED:
@@ -1636,10 +2170,19 @@ static int bhyve_vcpu_run(CPUState *cpu) {
                 rc = 1;
             }
             break;
-        case VM_EXITCODE_VMX:
+        case VM_EXITCODE_VMX: {
+            static int vmx_err_log = 0;
+            if (vmx_err_log < 5) {
+                fprintf(stderr, "VMX_ERROR[%d]: rip=0x%lx status=%d inst_type=%d inst_error=%d exit_reason=%d\n",
+                        cpu->cpu_index, (unsigned long)vme.rip,
+                        vme.u.vmx.status, vme.u.vmx.inst_type,
+                        vme.u.vmx.inst_error, vme.u.vmx.exit_reason);
+                vmx_err_log++;
+            }
             dump_registers(qcpu->vcpu);
             rc = -1;
             break;
+        }
         case VM_EXITCODE_SVM:
             rc = -1;
             break;
@@ -1663,9 +2206,117 @@ static int bhyve_vcpu_run(CPUState *cpu) {
                 bql_unlock();
             }
             continue;
-        case VM_EXITCODE_IPI:
-            printf("Received an IPI\n");
+        case VM_EXITCODE_IPI: {
+            /*
+             * IPI exit: the guest wrote to ICR to send an inter-processor
+             * interrupt. The kernel decoded the destination into dmask
+             * (cpuset_t). We translate INIT/SIPI/Fixed into QEMU
+             * cpu_interrupt() calls on the target vCPUs.
+             */
+            uint32_t ipi_mode = vme.u.ipi.mode;
+            uint8_t ipi_vector = vme.u.ipi.vector;
+            int target_cpu;
+            static int ipi_log = 0;
+
+            if (ipi_log < 20) {
+                fprintf(stderr, "IPI: mode=0x%x vec=%d dmask targets:",
+                        ipi_mode, ipi_vector);
+            }
+
+            bql_lock();
+            CPU_FOREACH_ISSET(target_cpu, &dmask) {
+                CPUState *target_cs = qemu_get_cpu(target_cpu);
+                if (!target_cs) {
+                    if (ipi_log < 20)
+                        fprintf(stderr, " [%d:MISSING]", target_cpu);
+                    continue;
+                }
+                if (ipi_log < 20)
+                    fprintf(stderr, " %d", target_cpu);
+
+                switch (ipi_mode) {
+                case APIC_DELMODE_INIT:
+                    /*
+                     * INIT: let QEMU handle via do_cpu_init which
+                     * resets the APIC and sets wait_for_sipi=1.
+                     * The kernel already called vm_await_start().
+                     */
+                    cpu_interrupt(target_cs, CPU_INTERRUPT_INIT);
+                    if (ipi_log < 20)
+                        fprintf(stderr, "(INIT)");
+                    break;
+                case APIC_DELMODE_STARTUP: {
+                    /*
+                     * SIPI: activate AP in kernel, then use QEMU's
+                     * standard SIPI path. QEMU handles everything:
+                     * do_cpu_init (cpu_reset + apic_init_reset) +
+                     * do_cpu_sipi (cpu_x86_load_seg_cache_sipi).
+                     *
+                     * DO NOT call vcpu_reset — let QEMU's cpu_reset
+                     * set the definitive state, then vmm_set_registers
+                     * syncs it to the kernel VMCS.
+                     */
+                    AccelCPUState *tqcpu = target_cs->accel;
+                    X86CPU *target_x86 = X86_CPU(target_cs);
+                    int aerr;
+
+                    /* Activate AP in kernel (idempotent) */
+                    aerr = vm_activate_cpu(tqcpu->vcpu);
+                    /* Suspend: bhyve_vcpu_exec will call vm_resume_cpu */
+                    vm_suspend_cpu(tqcpu->vcpu);
+
+                    /* Set SIPI vector in QEMU's APIC state and
+                     * signal the AP thread (mirrors apic_startup) */
+                    target_x86->apic_state->sipi_vector = ipi_vector;
+                    cpu_interrupt(target_cs, CPU_INTERRUPT_SIPI);
+
+                    /* Wake QEMU AP thread */
+                    target_cs->halted = false;
+                    target_cs->stopped = false;
+                    tqcpu->dirty = true;
+
+                    if (ipi_log < 20)
+                        fprintf(stderr, "(SIPI:act=%d,vec=%d)",
+                                aerr, ipi_vector);
+                    break;
+                }
+                case APIC_DELMODE_FIXED:
+                case APIC_DELMODE_LOWPRIO: {
+                    /*
+                     * Fixed/LowPri IPI: inject the vector into the target's
+                     * kernel vLAPIC (sets IRR), then kick the target vCPU
+                     * so it re-enters vm_run where the kernel injects it.
+                     *
+                     * Without vm_lapic_irq(), cpu_interrupt(HARD) only wakes
+                     * the target but pre_run clears the flag without injecting
+                     * any vector — the IPI is lost, causing ~30s cross-CPU
+                     * stalls (BSP times out waiting for AP acknowledgement).
+                     */
+                    AccelCPUState *tqcpu = target_cs->accel;
+                    int ipi_err = vm_lapic_irq(tqcpu->vcpu, ipi_vector);
+                    if (ipi_log < 20)
+                        fprintf(stderr, "(FIXED:vec=%d,err=%d)", ipi_vector, ipi_err);
+                    cpu_interrupt(target_cs, CPU_INTERRUPT_HARD);
+                    break;
+                }
+                case APIC_DELMODE_NMI:
+                    cpu_interrupt(target_cs, CPU_INTERRUPT_NMI);
+                    break;
+                default:
+                    if (ipi_log < 20)
+                        fprintf(stderr, "(unhandled mode 0x%x)", ipi_mode);
+                    break;
+                }
+            }
+            bql_unlock();
+
+            if (ipi_log < 20) {
+                fprintf(stderr, "\n");
+                fflush(stderr);
+                ipi_log++;
+            }
             break;
+        }
         default:
             exit_other++;
             printf("Unhandled exit (code=%d). Register Dump...\n", exitcode);
@@ -1785,17 +2436,37 @@ int bhyve_init_vcpu(CPUState *cpu)
             }
         }
     } else {
-        err = vcpu_reset(qcpu->vcpu);
+        /*
+         * AP: set up capabilities. Activate in the kernel so the AP
+         * appears in vm_active_cpus() — required for vlapic_calcdest()
+         * to include it in INIT/SIPI IPI destinations. Without this,
+         * the BSP's INIT+SIPI to wake the AP is silently dropped.
+         *
+         * We also suspend the AP (adds to debug_cpus, not
+         * suspended_cpus) so vm_resume_cpu can be called before the
+         * first vm_run.
+         */
         err = vm_set_capability(qcpu->vcpu,
             VM_CAP_UNRESTRICTED_GUEST, 1);
+        cpu->halted = true;
+        cpu->stopped = true;
+        fprintf(stderr, "AP cpu_index=%d: halted, will activate on SIPI\n",
+                cpu->cpu_index);
     }
 
-    /* Activate and suspend CPU (required by bhyve protocol — suspend sets
-     * debug_cpus, resume clears it before the first vm_run) */
-    err = vm_activate_cpu(qcpu->vcpu);
-    fprintf(stderr, "vm_activate_cpu: %d\n", err);
-    err = vm_suspend_cpu(qcpu->vcpu);
-    fprintf(stderr, "vm_suspend_cpu: %d\n", err);
+    {
+        /* Activate+suspend ALL vCPUs (BSP and APs).
+         * Activate makes the vCPU visible in vm_active_cpus(),
+         * which is needed for:
+         *  - BSP: normal operation
+         *  - APs: so vlapic_calcdest() includes them in IPI targets
+         * Suspend sets debug_cpus so vm_resume_cpu works on first vm_run.
+         */
+        err = vm_activate_cpu(qcpu->vcpu);
+        fprintf(stderr, "vm_activate_cpu[%d]: %d\n", cpu->cpu_index, err);
+        err = vm_suspend_cpu(qcpu->vcpu);
+        fprintf(stderr, "vm_suspend_cpu[%d]: %d\n", cpu->cpu_index, err);
+    }
 
     // Sync registers on exec
     qcpu->dirty = true;
@@ -1810,13 +2481,27 @@ void bhyve_destroy_vcpu(CPUState *cpu) {
 
     AccelCPUState *qcpu = cpu->accel;
 
+    if (qcpu->lapic_poll_timer) {
+        timer_del(qcpu->lapic_poll_timer);
+        timer_free(qcpu->lapic_poll_timer);
+        qcpu->lapic_poll_timer = NULL;
+    }
     vm_vcpu_close(qcpu->vcpu);
 }
 
 int bhyve_vcpu_exec(CPUState *cpu)
 {
     int ret;
-    static int resume_debug = 1;
+    static int resume_debug = 2;  /* per-CPU debug */
+    static int exec_enter_log = 0;
+
+    if (exec_enter_log < 4) {
+        fprintf(stderr, "bhyve_vcpu_exec[%d]: enter exception_index=%d halted=%d stopped=%d\n",
+                cpu->cpu_index, cpu->exception_index, cpu->halted, cpu->stopped);
+        fflush(stderr);
+        exec_enter_log++;
+    }
+
     while (1) {
         if (cpu->exception_index >= EXCP_INTERRUPT) {
             ret = cpu->exception_index;
@@ -1825,9 +2510,11 @@ int bhyve_vcpu_exec(CPUState *cpu)
         }
 
         ret = vm_resume_cpu(cpu->accel->vcpu);
-        if (resume_debug) {
-            fprintf(stderr, "vm_resume_cpu: %d (errno=%d)\n", ret, errno);
-            resume_debug = 0;
+        if (resume_debug > 0) {
+            fprintf(stderr, "vm_resume_cpu[%d]: %d (errno=%d)\n",
+                    cpu->cpu_index, ret, errno);
+            fflush(stderr);
+            resume_debug--;
         }
         ret = bhyve_vcpu_run(cpu);
         if (ret != 0) {
@@ -2187,12 +2874,91 @@ static int do_open(const char *vmname, MachineState* ms) {
 }
 
 
+/*
+ * Main-loop diagnostic timer: fires every second to verify
+ * the QEMU main event loop is running and processing events.
+ */
+/*
+ * Workaround for broken glib main-loop dispatch with bhyve accelerator.
+ *
+ * The glib GSource mechanism (used by all QEMU chardev backends to poll
+ * stdin/sockets for incoming data) stops dispatching after initialization.
+ * QEMU timers (QEMU_CLOCK_REALTIME) still work because they go through
+ * qemu_clock_run_all_timers(), not glib dispatch.
+ *
+ * Fix: poll stdin directly from a QEMU timer callback (which fires with
+ * BQL held) and inject characters into the chardev via qemu_chr_be_write().
+ */
+#include <fcntl.h>
+#include "chardev/char.h"
+#include "chardev/char-fe.h"
+
+static QEMUTimer *mainloop_diag_timer;
+static Chardev *stdin_chardev = NULL;
+static bool stdin_nonblock_set = false;
+
+static void mainloop_diag_cb(void *opaque)
+{
+    static long tick = 0;
+    tick++;
+
+    /* Lazy lookup of the chardev — try common names */
+    if (!stdin_chardev) {
+        stdin_chardev = qemu_chr_find("con0");      /* virtio-console */
+        if (!stdin_chardev)
+            stdin_chardev = qemu_chr_find("serial0"); /* -serial stdio */
+        if (!stdin_chardev)
+            stdin_chardev = qemu_chr_find("compat_monitor0");
+        if (stdin_chardev && tick <= 3) {
+            fprintf(stderr, "STDIN_POLL: found chardev '%s'\n",
+                    stdin_chardev->label ? stdin_chardev->label : "?");
+            fflush(stderr);
+        }
+    }
+
+    /* Set stdin to non-blocking (once) */
+    if (!stdin_nonblock_set) {
+        int flags = fcntl(STDIN_FILENO, F_GETFL);
+        if (flags >= 0) {
+            fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK);
+            stdin_nonblock_set = true;
+        }
+    }
+
+    /* Poll stdin and inject into chardev */
+    if (stdin_chardev && stdin_nonblock_set) {
+        uint8_t buf[64];
+        int n = read(STDIN_FILENO, buf, sizeof(buf));
+        if (n > 0) {
+            qemu_chr_be_write(stdin_chardev, buf, n);
+            static long chars_injected = 0;
+            chars_injected += n;
+            if (chars_injected <= 20) {
+                fprintf(stderr, "STDIN_POLL: injected %d bytes (total=%ld) first=0x%02x '%c'\n",
+                        n, chars_injected, buf[0],
+                        (buf[0] >= 0x20 && buf[0] < 0x7f) ? buf[0] : '.');
+                fflush(stderr);
+            }
+        }
+    }
+
+    /* Re-arm: 5ms for responsive input */
+    timer_mod_ns(mainloop_diag_timer,
+                 qemu_clock_get_ns(QEMU_CLOCK_REALTIME) + 5000000LL);
+}
+
 static int
 bhyve_accel_init(AccelState *as, MachineState *ms)
 {
     int err;
     printf("Bhyve Accelerator Machine Initialization\n");
     atexit(mmio_print_stats);
+
+    /* Start main-loop diagnostic timer */
+    mainloop_diag_timer = timer_new_ns(QEMU_CLOCK_REALTIME,
+                                        mainloop_diag_cb, NULL);
+    timer_mod_ns(mainloop_diag_timer,
+                 qemu_clock_get_ns(QEMU_CLOCK_REALTIME) + 1000000000LL);
     /* Also handle SIGTERM (from timeout) */
     signal(SIGTERM, SIG_DFL); /* Will be overridden below */
 

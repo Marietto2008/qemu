@@ -6,6 +6,9 @@
 
 #include <vmmapi.h>
 
+/* Forward declaration — CPUState is typedef'd in qemu/typedefs.h */
+struct CPUState;
+
 #define SUPERPAGE_SIZE (1 << 21)
 
 #define IN_MEMRANGE(host, range, test) ((test >= host) && (test < (host + range)))
@@ -53,5 +56,12 @@ extern volatile uint32_t bhyve_ioapic_pending_irqs;
 
 /* IOAPIC vector table — set by bhyve_ioapic_set_irq from QEMU's model */
 extern volatile uint8_t bhyve_ioapic_vectors[24];
+
+/*
+ * Inject an interrupt vector directly into a vCPU's kernel vLAPIC.
+ * Used by PIC/IOAPIC set_irq to wake vCPUs sleeping in-kernel HLT.
+ * cpu must be a valid CPUState with accel state initialized.
+ */
+void bhyve_inject_lapic_irq(struct CPUState *cpu, int vector);
 
 #endif /* TARGET_I386_BHYVE_INTERNAL_H */
