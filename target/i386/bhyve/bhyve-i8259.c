@@ -1,0 +1,152 @@
+#include "qemu/osdep.h"
+#include "hw/isa/i8259_internal.h"
+#include "hw/intc/i8259.h"
+#include "qemu/module.h"
+#include "system/bhyve.h"
+#include "hw/core/irq.h"
+#include "hw/core/cpu.h"
+#include "exec/cpu-interrupt.h"
+#include "qom/object.h"
+#include "bhyve-internal.h"
+
+/**
+ * BhyvePICClass:
+ * @parent_realize: The parent's realizefn.
+ */
+typedef struct {
+    PICCommonClass parent_class;
+
+    DeviceRealize parent_realize;
+} BhyvePICClass;
+
+#define TYPE_BHYVE_I8259 "bhyve-i8259"
+DECLARE_CLASS_CHECKERS(BhyvePICClass, BHYVE_PIC,
+                       TYPE_BHYVE_I8259)
+
+
+static void bhyve_pic_get(PICCommonState *s)
+{
+}
+
+static void bhyve_pic_put(PICCommonState *s)
+{
+}
+
+static void bhyve_pic_reset(DeviceState *dev)
+{
+    PICCommonState *s = PIC_COMMON(dev);
+
+    s->elcr = 0;
+    pic_reset_common(s);
+
+    bhyve_pic_put(s);
+}
+
+volatile long pic_irq0_assert = 0;
+volatile long pic_irq0_deassert = 0;
+volatile long pic_other_irq = 0;
+
+/*
+ * Bitmask of pending ISA IRQs for userspace injection.
+ * Set by bhyve_pic_set_irq when level=1, cleared by pre_run
+ * after injecting the vector into the vLAPIC.
+ */
+volatile uint32_t bhyve_pic_pending_irqs = 0;
+
+static void bhyve_pic_set_irq(void *opaque, int irq, int level)
+{
+    int err;
+    pic_stat_update_irq(irq, level);
+
+    if (irq == 0) {
+        if (level) pic_irq0_assert++;
+        else pic_irq0_deassert++;
+    } else {
+        pic_other_irq++;
+    }
+
+    /* Log first few IRQ0 assertions to confirm PIT is firing */
+    if (irq == 0 && level && pic_irq0_assert <= 5) {
+        fprintf(stderr, "PIC: IRQ0 assert #%ld (PIT timer fired!)\n",
+                pic_irq0_assert);
+        fflush(stderr);
+    }
+    /* Log non-IRQ0 interrupts (first few) */
+    if (irq != 0 && pic_other_irq <= 10) {
+        fprintf(stderr, "PIC: IRQ%d %s (#%ld)\n", irq,
+                level ? "assert" : "deassert", pic_other_irq);
+        fflush(stderr);
+    }
+
+    if (level) {
+        err = vm_isa_assert_irq(bhyve_mach.vm, irq, -1);
+        /* Track pending IRQ for userspace injection in pre_run */
+        __atomic_or_fetch(&bhyve_pic_pending_irqs, (1u << irq), __ATOMIC_RELEASE);
+    } else {
+        err = vm_isa_deassert_irq(bhyve_mach.vm, irq, -1);
+    }
+
+    /*
+     * Signal the CPU so it re-enters vm_run. Pre_run will read
+     * bhyve_pic_pending_irqs and inject the correct vector via
+     * vm_lapic_irq().
+     */
+    if (level) {
+        CPUState *cpu = first_cpu;
+        if (cpu) {
+            cpu_interrupt(cpu, CPU_INTERRUPT_HARD);
+        }
+    }
+
+    if (err) {
+        fprintf(stderr, "bhyve: 8259 failed, irq (%d) err=%d errno=%d (%s)\n",
+                irq, err, errno, strerror(errno));
+        fflush(stderr);
+    }
+}
+
+static void bhyve_pic_realize(DeviceState *dev, Error **errp)
+{
+    PICCommonState *s = PIC_COMMON(dev);
+    BhyvePICClass *bpc = BHYVE_PIC_GET_CLASS(dev);
+
+    memory_region_init_io(&s->base_io, OBJECT(dev), NULL, NULL, "bhyve-pic", 2);
+    memory_region_init_io(&s->elcr_io, OBJECT(dev), NULL, NULL, "bhyve-elcr", 1);
+
+    bpc->parent_realize(dev, errp);
+}
+
+qemu_irq *bhyve_i8259_init(ISABus *bus)
+{
+    i8259_init_chip(TYPE_BHYVE_I8259, bus, true);
+    i8259_init_chip(TYPE_BHYVE_I8259, bus, false);
+
+    return qemu_allocate_irqs(bhyve_pic_set_irq, NULL, ISA_NUM_IRQS);
+}
+
+static void bhyve_i8259_class_init(ObjectClass *klass, const void *data)
+{
+    BhyvePICClass *bpc = BHYVE_PIC_CLASS(klass);
+    PICCommonClass *k = PIC_COMMON_CLASS(klass);
+    DeviceClass *dc = DEVICE_CLASS(klass);
+
+    device_class_set_legacy_reset(dc, bhyve_pic_reset);
+    device_class_set_parent_realize(dc, bhyve_pic_realize, &bpc->parent_realize);
+    k->pre_save   = bhyve_pic_get;
+    k->post_load  = bhyve_pic_put;
+}
+
+static const TypeInfo bhyve_i8259_info = {
+    .name = TYPE_BHYVE_I8259,
+    .parent = TYPE_PIC_COMMON,
+    .instance_size = sizeof(PICCommonState),
+    .class_init = bhyve_i8259_class_init,
+    .class_size = sizeof(BhyvePICClass),
+};
+
+static void bhyve_pic_register_types(void)
+{
+    type_register_static(&bhyve_i8259_info);
+}
+
+type_init(bhyve_pic_register_types)
