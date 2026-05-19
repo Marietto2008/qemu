@@ -14,6 +14,7 @@
 #include "qemu/error-report.h"
 #include "qapi/error.h"
 #include "system/memory.h"
+#include "system/cpu-timers.h"
 #include "strings.h"
 #include "qapi/qapi-types-common.h"
 #include "qapi/qapi-visit-common.h"
@@ -27,8 +28,99 @@
 #include <errno.h>
 
 #include <machine/specialreg.h>
+
+/*
+ * Tracing wrapper for vm_lapic_irq — logs ALL low-vector injections
+ * to help debug trap 30 (reserved fault) in FreeBSD guest.
+ */
+static inline int traced_vm_lapic_irq(struct vcpu *vcpu, int vector,
+                                       const char *caller, int line)
+{
+    if (vector < 32) {
+        fprintf(stderr, "*** TRACED_LAPIC_IRQ: vector=%d (0x%x) from %s:%d — "
+                "LOW VECTOR, would cause guest trap!\n",
+                vector, vector, caller, line);
+        return (-1);  /* block injection */
+    }
+    return vm_lapic_irq(vcpu, vector);
+}
+/* Replace all direct vm_lapic_irq calls with traced version */
+#define vm_lapic_irq(vcpu, vector) \
+    traced_vm_lapic_irq((vcpu), (vector), __func__, __LINE__)
 #include <string.h>
+#include <sys/ioctl.h>
 #include <vmmapi.h>
+#include <machine/vmm_dev.h>
+
+/*
+ * Scrub low vectors (0-31) from the in-kernel LAPIC IRR.
+ *
+ * The UEFI firmware programs the LAPIC timer with a low vector (e.g. 30).
+ * When the FreeBSD kernel does STI for the first time, this stale timer
+ * interrupt fires as trap 30 (reserved fault), crashing the guest.
+ *
+ * We cannot intercept in-kernel LAPIC vector injection from userspace,
+ * so we periodically read the LAPIC state via ioctl, clear any low
+ * vectors from IRR, and also mask the LVT Timer if its vector is < 32.
+ *
+ * NOTE: vcpu_ioctl() overwrites the first 4 bytes of the ioctl data
+ * with the vcpuid, so fields[0].data is clobbered by the vcpuid.
+ */
+/*
+ * Scrub dangerous vectors from in-kernel LAPIC IRR.
+ *
+ * Always scrubs:
+ *   - Vectors 0-31: would cause #GP if delivered
+ *   - Vector 32 (0x20): PIC master base — no IDT handler in FreeBSD
+ *   - Vector 64 (0x40): UEFI PIC base — no IDT handler in FreeBSD
+ *
+ * These PIC-base vectors are injected by the bhyve kernel's vatpic
+ * or by QEMU's interrupt routing and have no corresponding IDT handler
+ * in the FreeBSD guest (the guest uses IOAPIC vectors >= 48).
+ */
+static void scrub_lapic_bad_vectors(struct vcpu *vcpu)
+{
+    struct vm_lapic_state state;
+
+    memset(&state, 0, sizeof(state));
+
+    int err = vcpu_ioctl(vcpu, VM_LAPIC_GET_STATE, &state);
+    if (err < 0)
+        return;
+
+    int modified = 0;
+
+    /* IRR[0]: vectors 0-31 — always clear ALL */
+    if (state.fields[0x20].data != 0) {
+        state.fields[0x20].data = 0;
+        modified = 1;
+    }
+
+    /* IRR[1]: vectors 32-63 — clear vector 32 (PIC base 0x20) */
+    uint32_t irr1 = state.fields[0x21].data;
+    if (irr1 & (1u << 0)) {  /* bit 0 = vector 32 */
+        state.fields[0x21].data = irr1 & ~(1u << 0);
+        modified = 1;
+    }
+
+    /* IRR[2]: vectors 64-95 — clear vector 64 (UEFI PIC base 0x40) */
+    uint32_t irr2 = state.fields[0x22].data;
+    if (irr2 & (1u << 0)) {  /* bit 0 = vector 64 */
+        state.fields[0x22].data = irr2 & ~(1u << 0);
+        modified = 1;
+    }
+
+    /* Check LVT Timer for low vector */
+    uint32_t lvt_timer = state.fields[0x32].data;
+    if ((lvt_timer & 0xFF) < 32 && !((lvt_timer >> 16) & 1)) {
+        state.fields[0x32].data = lvt_timer | (1 << 16);
+        modified = 1;
+    }
+
+    if (modified) {
+        vcpu_ioctl(vcpu, VM_LAPIC_SET_STATE, &state);
+    }
+}
 
 /* -------------------------------------------------------------------------- */
 
@@ -108,7 +200,6 @@ static void mmio_print_stats(void) {
             exit_debug, exit_pause, exit_other,
             pic_irq0_assert, pic_irq0_deassert,
             pic_other_irq);
-    fflush(stderr);
 }
 
 #define VM_NAME "vm2"
@@ -162,6 +253,11 @@ bhyve_enabled(void) {
 void bhyve_inject_lapic_irq(CPUState *cpu, int vector)
 {
     if (cpu && cpu->accel && cpu->accel->vcpu) {
+        if (vector < 32) {
+            fprintf(stderr, "*** LAPIC_IRQ: BLOCKED low vector %d (0x%x) — "
+                    "would cause guest trap!\n", vector, vector);
+            return;
+        }
         vm_lapic_irq(cpu->accel->vcpu, vector);
     }
 }
@@ -297,58 +393,6 @@ vmm_get_segment(struct vcpu *vcpu, int reg, const SegmentCache *qseg)
 }
 */
 
-/* Debug version: logs which register fails */
-static void vmm_set_registers_debug(CPUState *cpu) {
-    CPUX86State *env = cpu_env(cpu);
-    AccelCPUState *qcpu = cpu->accel;
-    struct vcpu* vcpu = qcpu->vcpu;
-    int ret;
-#define TRY_SET(name, reg, val) do { \
-    ret = vm_set_register(vcpu, (reg), (val)); \
-    if (ret != 0) fprintf(stderr, "  SET_REG FAIL: %s = 0x%lx err=%d errno=%d\n", \
-                          name, (unsigned long)(val), ret, errno); \
-} while(0)
-    TRY_SET("RAX", VM_REG_GUEST_RAX, env->regs[R_EAX]);
-    TRY_SET("RIP", VM_REG_GUEST_RIP, env->eip);
-    TRY_SET("RFLAGS", VM_REG_GUEST_RFLAGS, env->eflags);
-    TRY_SET("CR0", VM_REG_GUEST_CR0, env->cr[0]);
-    TRY_SET("CR3", VM_REG_GUEST_CR3, env->cr[3]);
-    TRY_SET("CR4", VM_REG_GUEST_CR4, env->cr[4]);
-    TRY_SET("EFER", VM_REG_GUEST_EFER, env->efer);
-    TRY_SET("DR7", VM_REG_GUEST_DR7, env->dr[7]);
-    fprintf(stderr, "  vmm_set_registers_debug: eip=0x%lx cr0=0x%lx cr4=0x%lx efer=0x%lx eflags=0x%lx\n",
-            (unsigned long)env->eip, (unsigned long)env->cr[0],
-            (unsigned long)env->cr[4], (unsigned long)env->efer,
-            (unsigned long)env->eflags);
-    /* Try segments */
-    {
-        struct { int reg; int qemu_idx; const char *name; } segs[] = {
-            { VM_REG_GUEST_CS, R_CS, "CS" },
-            { VM_REG_GUEST_DS, R_DS, "DS" },
-            { VM_REG_GUEST_SS, R_SS, "SS" },
-        };
-        for (int i = 0; i < 3; i++) {
-            ret = vm_set_register(vcpu, segs[i].reg, env->segs[segs[i].qemu_idx].selector);
-            if (ret != 0) fprintf(stderr, "  SET_REG FAIL: %s selector err=%d\n", segs[i].name, ret);
-            /* Try setting desc */
-            uint32_t _f = env->segs[segs[i].qemu_idx].flags;
-            uint32_t _lo = (_f >> 8) & 0xFF;
-            uint32_t _l  = (_f >> 21) & 1;
-            uint32_t _db = (_f >> 22) & 1;
-            uint32_t _g  = (_f >> 23) & 1;
-            uint32_t _ar = _lo | (_l << 13) | (_db << 14) | (_g << 15);
-            if (!(_ar & 0x80)) _ar |= (1 << 16);
-            ret = vm_set_desc(vcpu, segs[i].reg,
-                              env->segs[segs[i].qemu_idx].base,
-                              env->segs[segs[i].qemu_idx].limit, _ar);
-            if (ret != 0) fprintf(stderr, "  SET_DESC FAIL: %s base=0x%lx limit=0x%x ar=0x%x flags=0x%x err=%d errno=%d\n",
-                                  segs[i].name, (unsigned long)env->segs[segs[i].qemu_idx].base,
-                                  (unsigned)env->segs[segs[i].qemu_idx].limit, _ar, _f, ret, errno);
-        }
-    }
-#undef TRY_SET
-}
-
 static int vmm_set_registers(CPUState *cpu) {
     CPUX86State *env = cpu_env(cpu);
     AccelCPUState *qcpu = cpu->accel;
@@ -356,29 +400,16 @@ static int vmm_set_registers(CPUState *cpu) {
 
     /* GPRs */
     int ret;
-    static int set_reg_debug = 1; /* enable for first failure */
+    int any_fail __attribute__((unused)) = 0;
 
-    int any_fail = 0;
 #define VM_SET_REG_CHECK(name, reg, val) do { \
     ret = vm_set_register(vcpu, (reg), (val)); \
-    if (ret != 0) { \
-        if (set_reg_debug) { \
-            fprintf(stderr, "vmm_set_registers: FAIL at %s reg=%d val=0x%lx err=%d errno=%d\n", \
-                    name, (reg), (unsigned long)(val), ret, errno); \
-        } \
-        any_fail = ret; \
-    } \
+    if (ret != 0) any_fail = ret; \
 } while(0)
 
 #define VM_SET_DESC_CHECK(name, reg, base, limit, ar) do { \
     ret = vm_set_desc(vcpu, (reg), (base), (limit), (ar)); \
-    if (ret != 0) { \
-        if (set_reg_debug) { \
-            fprintf(stderr, "vmm_set_desc: FAIL at %s base=0x%lx limit=0x%x ar=0x%x err=%d errno=%d\n", \
-                    name, (unsigned long)(base), (unsigned)(limit), (unsigned)(ar), ret, errno); \
-        } \
-        any_fail = ret; \
-    } \
+    if (ret != 0) any_fail = ret; \
 } while(0)
 
     // General-Purpose Registers
@@ -502,9 +533,6 @@ static int vmm_set_registers(CPUState *cpu) {
 
 #undef VM_SET_REG_CHECK
 #undef VM_SET_DESC_CHECK
-    if (any_fail && set_reg_debug) {
-        set_reg_debug = 0; /* only log once */
-    }
     return 0; /* Continue even if some registers fail (TPR, KGS_BASE etc.
                * are kernel-managed and vmx_setreg doesn't support SET) */
 }
@@ -746,32 +774,28 @@ vmm_io_callback(struct vm_qio *io)
     int ret;
 
     io_total++;
+    /*
+     * ACPI PM Timer (port 0x408): if address_space_rw returns 0xffffffff
+     * it means the PIIX4 PM I/O region isn't mapped yet. Provide the
+     * correct PM Timer value directly from the virtual clock.
+     * PM Timer ticks at 3.579545 MHz, 24-bit counter.
+     */
     ret = address_space_rw(&address_space_io, io->port, attrs, io->data,
         io->size, !io->in);
+    if (io->port == 0x408 && io->in && io->size == 4) {
+        uint32_t val = *(uint32_t *)io->data;
+        if (val == 0xffffffff) {
+            /* Region not mapped — compute PM timer value directly */
+            int64_t ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+            uint32_t ticks = (uint32_t)muldiv64(ns, 3579545, 1000000000LL);
+            ticks &= 0xffffff; /* 24-bit counter */
+            *(uint32_t *)io->data = ticks;
+        }
+    }
     if (ret != MEMTX_OK) {
         error_report("Bhyve: I/O Transaction Failed "
             "[%s, port=%u, size=%zu]", (io->in ? "in" : "out"),
             io->port, io->size);
-    }
-
-    /* Log IDE I/O after kernel takes over (skip first 5000 total IOs = SeaBIOS) */
-    {
-        static long io_count = 0;
-        static int ide_log = 0;
-        uint16_t port = io->port;
-        io_count++;
-        if (io_count > 5000 && ide_log < 100) {
-            if ((port >= 0x1f0 && port <= 0x1f7) ||
-                (port >= 0x170 && port <= 0x177) ||
-                port == 0x3f6 || port == 0x376) {
-                fprintf(stderr, "IDE[%ld]: %s port=0x%04x size=%zu data=0x",
-                        io_count, io->in ? "IN " : "OUT", port, io->size);
-                for (int j = (int)io->size - 1; j >= 0; j--)
-                    fprintf(stderr, "%02x", io->data[j]);
-                fprintf(stderr, "\n");
-                ide_log++;
-            }
-        }
     }
 
     current_cpu->accel->dirty = false;
@@ -1005,11 +1029,8 @@ static void bhyve_vcpu_pre_run(CPUState *cpu) {
     X86CPU *x86_cpu = X86_CPU(cpu);
     uint8_t tpr;
     bool sync_tpr = false;
-    int ret;
 
     bql_lock();
-
-    /* Suppressed PRE_RUN noise */
 
     // TPR is always synced (check bhyve-apic)
     tpr = cpu_get_apic_tpr(x86_cpu->apic_state);
@@ -1029,7 +1050,6 @@ static void bhyve_vcpu_pre_run(CPUState *cpu) {
     /* Handle NMIs (vmm takes care of nmi windows and interrupt shadows) */
     if (cpu->interrupt_request & CPU_INTERRUPT_NMI) {
         cpu->interrupt_request &= ~CPU_INTERRUPT_NMI;
-        printf("Hung here\n");
         vm_inject_nmi(vcpu);
     }
 
@@ -1086,21 +1106,23 @@ static void bhyve_vcpu_pre_run(CPUState *cpu) {
                 }
             }
 
-            /* Fall back to PIC vector if IOAPIC not yet configured */
+            /*
+             * If IOAPIC not configured for this pin, DROP the interrupt.
+             * Don't fall back to PIC vectors (0x20+irq) — those vectors
+             * likely have no IDT handler during early boot and would
+             * cause trap 30 (Xrsvd). The guest will receive the interrupt
+             * through the IOAPIC once it programs the proper RTE.
+             */
             if (vector == 0) {
-                vector = (irq < 8) ? (0x20 + irq) : (0x28 + irq - 8);
-            }
-
-            int irq_err = vm_lapic_irq(vcpu, vector);
-
-            {
-                static int inj_log = 0;
-                if (inj_log < 50) {
-                    fprintf(stderr, "IRQ_INJ[%d]: irq=%d pin=%d vec=0x%x err=%d irq0=%ld\n",
-                            inj_log, irq, pin, vector, irq_err,
-                            pic_irq0_assert);
-                    inj_log++;
-                }
+                static int pic_drop_log = 0;
+                if (pic_drop_log++ < 5)
+                    fprintf(stderr, "*** PIC IRQ%d dropped: IOAPIC pin %d "
+                            "not configured yet\n", irq, pin);
+            } else if (vector < 32) {
+                fprintf(stderr, "*** PRE_RUN PIC: BLOCKED low vector %d "
+                        "(irq=%d pin=%d)\n", vector, irq, pin);
+            } else {
+                vm_lapic_irq(vcpu, vector);
             }
 
             /* If multiple IRQs pending, re-set the flag for next pre_run */
@@ -1129,27 +1151,26 @@ static void bhyve_vcpu_pre_run(CPUState *cpu) {
 
                 int vector = (pin < 24) ? bhyve_ioapic_vectors[pin] : 0;
 
-                if (vector >= 0x10) {
-                    int err = vm_lapic_irq(vcpu, vector);
-                    {
-                        static int ioapic_inj_log = 0;
-                        if (ioapic_inj_log < 30) {
-                            fprintf(stderr, "IOAPIC_INJ[%d]: pin=%d vec=0x%x err=%d\n",
-                                    ioapic_inj_log, pin, vector, err);
-                            ioapic_inj_log++;
-                        }
-                    }
+                if (vector >= 0x10 && vector >= 32) {
+                    vm_lapic_irq(vcpu, vector);
+                } else if (vector >= 0x10 && vector < 32) {
+                    fprintf(stderr, "*** PRE_RUN IOAPIC: BLOCKED low vector "
+                            "%d (pin=%d) — would cause guest trap!\n",
+                            vector, pin);
                 } else {
-                    /* Vector not yet programmed — re-queue */
-                    __atomic_or_fetch(&bhyve_ioapic_pending_irqs,
-                                      (1u << pin), __ATOMIC_RELEASE);
+                    /* Vector not yet programmed — drop (guest will
+                     * re-trigger once IOAPIC RTEs are configured) */
+                    static int ioapic_drop_log = 0;
+                    if (ioapic_drop_log++ < 5)
+                        fprintf(stderr, "*** IOAPIC pin %d dropped: "
+                                "vector not configured\n", pin);
                 }
             }
         }
     }
 
     if (sync_tpr) {
-        ret = vm_set_register(vcpu, VM_REG_GUEST_TPR, qcpu->tpr);
+        vm_set_register(vcpu, VM_REG_GUEST_TPR, qcpu->tpr);
     }
 
     bql_unlock();
@@ -1161,13 +1182,12 @@ static void bhyve_vcpu_post_run(CPUState *cpu) {
     AccelCPUState *qcpu = cpu->accel;
     struct vcpu *vcpu = qcpu->vcpu;
     uint64_t val;
-    int ret;
 
     // Set Eflags
-    ret = vm_get_register(vcpu, VM_REG_GUEST_RFLAGS, &env->eflags);
+    vm_get_register(vcpu, VM_REG_GUEST_RFLAGS, &env->eflags);
 
     // TPR
-    ret = vm_get_register(vcpu, VM_REG_GUEST_TPR, &val);
+    vm_get_register(vcpu, VM_REG_GUEST_TPR, &val);
     if (qcpu->tpr != val) {
         qcpu->tpr = val;
         bql_lock();
@@ -1198,17 +1218,9 @@ static int bhyve_vcpu_run(CPUState *cpu) {
 	vmrun.cpusetsize = sizeof(dmask);
 
     if (cpu->interrupt_request & CPU_INTERRUPT_INIT) {
-        fprintf(stderr, "INIT[%d]: processing, irq_req=0x%x apic=%p\n",
-                cpu->cpu_index, cpu->interrupt_request,
-                (void *)x86_cpu->apic_state);
         bhyve_cpu_synchronize_state(cpu);
         do_cpu_init(x86_cpu);
         qcpu->wait_for_sipi = true;  /* Accept next SIPI, reject duplicates */
-        fprintf(stderr, "INIT[%d]: after do_cpu_init, wait_for_sipi=%d bsp=%d apicbase=0x%lx\n",
-                cpu->cpu_index,
-                x86_cpu->apic_state ? x86_cpu->apic_state->wait_for_sipi : -1,
-                x86_cpu->apic_state ? cpu_is_bsp(x86_cpu) : -1,
-                x86_cpu->apic_state ? (unsigned long)cpu_get_apic_base(x86_cpu->apic_state) : 0);
         /* After cpu_reset, QEMU state is definitive. Write it to
          * kernel VMCS so subsequent reads won't get stale data. */
         vmm_set_registers(cpu);
@@ -1229,12 +1241,6 @@ static int bhyve_vcpu_run(CPUState *cpu) {
             /* Read current kernel LAPIC state */
             lapic_err = vm_lapic_get_state(qcpu->vcpu, &lapic_state);
             if (lapic_err == 0) {
-                fprintf(stderr, "INIT[%d]: APIC ID field[2] BEFORE reset: 0x%08x (expected cpu_index=%d → 0x%08x)\n",
-                        cpu->cpu_index,
-                        lapic_state.fields[2].data,
-                        cpu->cpu_index,
-                        (uint32_t)(cpu->cpu_index << 24));
-
                 /* Zero out IRR (Interrupt Request Register) — indices 0x20..0x27 */
                 for (int i = 0x20; i <= 0x27; i++)
                     lapic_state.fields[i].data = 0;
@@ -1271,23 +1277,16 @@ static int bhyve_vcpu_run(CPUState *cpu) {
                  */
                 lapic_state.fields[2].data = (uint32_t)(cpu->cpu_index << 24);
 
-                fprintf(stderr, "INIT[%d]: APIC ID field[2] AFTER fix: 0x%08x\n",
-                        cpu->cpu_index, lapic_state.fields[2].data);
-
                 lapic_err = vm_lapic_set_state(qcpu->vcpu, &lapic_state);
-                fprintf(stderr, "INIT[%d]: kernel vLAPIC reset: %s\n",
-                        cpu->cpu_index,
-                        lapic_err == 0 ? "OK" : "FAILED");
+                if (lapic_err != 0) {
+                    fprintf(stderr, "INIT[%d]: kernel vLAPIC reset FAILED: %d\n",
+                            cpu->cpu_index, lapic_err);
+                }
             } else {
                 fprintf(stderr, "INIT[%d]: vm_lapic_get_state failed: %d\n",
                         cpu->cpu_index, lapic_err);
             }
         }
-
-        fprintf(stderr, "INIT[%d]: after vmm_set_registers, wait_for_sipi=%d irq_req=0x%x\n",
-                cpu->cpu_index,
-                x86_cpu->apic_state ? x86_cpu->apic_state->wait_for_sipi : -1,
-                cpu->interrupt_request);
     }
     if (cpu->interrupt_request & CPU_INTERRUPT_POLL) {
         cpu->interrupt_request &= ~CPU_INTERRUPT_POLL;
@@ -1314,8 +1313,6 @@ static int bhyve_vcpu_run(CPUState *cpu) {
          * trampoline while the AP is in 64-bit mode, causing corruption.
          */
         if (!qcpu->wait_for_sipi) {
-            fprintf(stderr, "SIPI[%d]: IGNORED (AP already running, not in wait-for-SIPI state)\n",
-                    cpu->cpu_index);
             goto sipi_done;
         }
         qcpu->wait_for_sipi = false;  /* First SIPI accepted; reject further */
@@ -1339,11 +1336,6 @@ static int bhyve_vcpu_run(CPUState *cpu) {
              * and the AP never executes guest code.
              */
             cpu->halted = false;
-            fprintf(stderr, "SIPI[%d]: direct, vec=%d eip=0x%lx cs_base=0x%lx cs_sel=0x%x dirty=true halted=false\n",
-                    cpu->cpu_index, sipi_vec,
-                    (unsigned long)env->eip,
-                    (unsigned long)env->segs[R_CS].base,
-                    (unsigned)env->segs[R_CS].selector);
 
             /* Start LAPIC poll timer for AP — same as BSP's HLT timer.
              * The AP needs periodic vm_run exits during init so the
@@ -1383,124 +1375,11 @@ static int bhyve_vcpu_run(CPUState *cpu) {
         if (qcpu->dirty) {
             vmm_set_registers(cpu);
             qcpu->dirty = false;
-            /* Log AP's first entry registers from kernel VMCS */
-            if (cpu->cpu_index > 0) {
-                static int ap_entry_log = 0;
-                if (ap_entry_log < 2) {
-                    uint64_t rip_k, cs_sel_k;
-                    uint64_t cs_base_k;
-                    uint32_t cs_limit_k, cs_ar_k;
-                    vm_get_register(qcpu->vcpu, VM_REG_GUEST_RIP, &rip_k);
-                    vm_get_register(qcpu->vcpu, VM_REG_GUEST_CS, &cs_sel_k);
-                    vm_get_desc(qcpu->vcpu, VM_REG_GUEST_CS, &cs_base_k, &cs_limit_k, &cs_ar_k);
-                    fprintf(stderr, "AP[%d] VMCS after set_registers: RIP=0x%lx CS=0x%lx base=0x%lx limit=0x%x ar=0x%x\n",
-                            cpu->cpu_index, (unsigned long)rip_k, (unsigned long)cs_sel_k,
-                            (unsigned long)cs_base_k, cs_limit_k, cs_ar_k);
-                    /* Also log CR0 to verify real mode */
-                    uint64_t cr0_k;
-                    vm_get_register(qcpu->vcpu, VM_REG_GUEST_CR0, &cr0_k);
-                    fprintf(stderr, "AP[%d] VMCS: CR0=0x%lx\n", cpu->cpu_index, (unsigned long)cr0_k);
-                    /* Dump guest physical memory via BOTH QEMU address_space and bhyve mmap */
-                    {
-                        hwaddr phys_addr = cs_base_k + rip_k;
-                        uint8_t code[64];
-                        MemTxResult mtr = address_space_read(
-                            &address_space_memory, phys_addr,
-                            MEMTXATTRS_UNSPECIFIED, code, sizeof(code));
-                        if (mtr == MEMTX_OK) {
-                            fprintf(stderr, "AP[%d] QEMU address_space at 0x%lx:", cpu->cpu_index, (unsigned long)phys_addr);
-                            for (int ci = 0; ci < 32; ci++) {
-                                if (ci % 16 == 0) fprintf(stderr, "\n  %04x:", ci);
-                                fprintf(stderr, " %02x", code[ci]);
-                            }
-                            fprintf(stderr, "\n");
-                        }
-                        /* Also read from bhyve's mmap'd guest memory */
-                        {
-                            char *baseaddr;
-                            struct bhyve_machine *mach_tmp = get_bhyve_mach();
-                            if (vm_get_guestmem_from_ctx(mach_tmp->vm, &baseaddr, NULL, NULL) == 0) {
-                                uint8_t *bhyve_mem = (uint8_t *)(baseaddr + phys_addr);
-                                fprintf(stderr, "AP[%d] BHYVE mmap at 0x%lx:", cpu->cpu_index, (unsigned long)phys_addr);
-                                for (int ci = 0; ci < 32; ci++) {
-                                    if (ci % 16 == 0) fprintf(stderr, "\n  %04x:", ci);
-                                    fprintf(stderr, " %02x", bhyve_mem[ci]);
-                                }
-                                fprintf(stderr, "\n");
-                            }
-                        }
-                    }
-                    ap_entry_log++;
-                }
-            }
         }
 
         bhyve_vcpu_pre_run(cpu);
 
         smp_rmb();
-        {
-            static int pre_run_debug = 0; /* set to 1 for VMX register dump */
-            if (pre_run_debug) {
-                uint64_t val;
-                int terr;
-                fprintf(stderr, "\n=== DRY-RUN: Full VMX register dump before vm_run ===\n");
-
-                /* GPRs */
-                terr = vm_get_register(qcpu->vcpu, VM_REG_GUEST_RIP, &val);
-                fprintf(stderr, "  RIP=0x%016lx (get=%d)\n", (unsigned long)val, terr);
-                terr = vm_get_register(qcpu->vcpu, VM_REG_GUEST_RFLAGS, &val);
-                fprintf(stderr, "  RFLAGS=0x%016lx (get=%d)\n", (unsigned long)val, terr);
-                terr = vm_get_register(qcpu->vcpu, VM_REG_GUEST_RAX, &val);
-                fprintf(stderr, "  RAX=0x%016lx\n", (unsigned long)val);
-                terr = vm_get_register(qcpu->vcpu, VM_REG_GUEST_RBX, &val);
-                fprintf(stderr, "  RBX=0x%016lx\n", (unsigned long)val);
-                terr = vm_get_register(qcpu->vcpu, VM_REG_GUEST_RCX, &val);
-                fprintf(stderr, "  RCX=0x%016lx\n", (unsigned long)val);
-                terr = vm_get_register(qcpu->vcpu, VM_REG_GUEST_RDX, &val);
-                fprintf(stderr, "  RDX=0x%016lx\n", (unsigned long)val);
-                terr = vm_get_register(qcpu->vcpu, VM_REG_GUEST_RSP, &val);
-                fprintf(stderr, "  RSP=0x%016lx\n", (unsigned long)val);
-
-                /* Segment selectors + descriptors (base, limit, access) via vm_get_desc */
-                fprintf(stderr, "  --- Segment Registers (from VMCS via vm_get_desc) ---\n");
-                {
-                    int seg_regs[] = { VM_REG_GUEST_CS, VM_REG_GUEST_DS, VM_REG_GUEST_ES,
-                                       VM_REG_GUEST_SS, VM_REG_GUEST_FS, VM_REG_GUEST_GS,
-                                       VM_REG_GUEST_TR, VM_REG_GUEST_LDTR };
-                    const char *seg_names[] = { "CS", "DS", "ES", "SS", "FS", "GS", "TR", "LDTR" };
-                    for (int i = 0; i < 8; i++) {
-                        uint64_t sel_v = 0, base_v = 0;
-                        uint32_t lim_v = 0, acc_v = 0;
-                        vm_get_register(qcpu->vcpu, seg_regs[i], &sel_v);
-                        vm_get_desc(qcpu->vcpu, seg_regs[i], &base_v, &lim_v, &acc_v);
-                        fprintf(stderr, "  %4s: sel=0x%04lx base=0x%016lx limit=0x%08x access=0x%08x\n",
-                                seg_names[i], (unsigned long)sel_v, (unsigned long)base_v, lim_v, acc_v);
-                    }
-                }
-
-                /* GDTR / IDTR */
-                uint64_t gdtr_base = 0, idtr_base = 0;
-                uint32_t gdtr_limit = 0, idtr_limit = 0, dummy_acc = 0;
-                vm_get_desc(qcpu->vcpu, VM_REG_GUEST_GDTR, &gdtr_base, &gdtr_limit, &dummy_acc);
-                vm_get_desc(qcpu->vcpu, VM_REG_GUEST_IDTR, &idtr_base, &idtr_limit, &dummy_acc);
-                fprintf(stderr, "  GDTR: base=0x%016lx limit=0x%04x\n", (unsigned long)gdtr_base, gdtr_limit);
-                fprintf(stderr, "  IDTR: base=0x%016lx limit=0x%04x\n", (unsigned long)idtr_base, idtr_limit);
-
-                /* Control registers */
-                terr = vm_get_register(qcpu->vcpu, VM_REG_GUEST_CR0, &val);
-                fprintf(stderr, "  CR0=0x%016lx (get=%d)\n", (unsigned long)val, terr);
-                terr = vm_get_register(qcpu->vcpu, VM_REG_GUEST_CR3, &val);
-                fprintf(stderr, "  CR3=0x%016lx\n", (unsigned long)val);
-                terr = vm_get_register(qcpu->vcpu, VM_REG_GUEST_CR4, &val);
-                fprintf(stderr, "  CR4=0x%016lx\n", (unsigned long)val);
-                terr = vm_get_register(qcpu->vcpu, VM_REG_GUEST_EFER, &val);
-                fprintf(stderr, "  EFER=0x%016lx\n", (unsigned long)val);
-
-                fprintf(stderr, "=== LIVE RUN: vm_run enabled with iteration limit ===\n");
-                fflush(stderr);
-                pre_run_debug = 0;
-            }
-        }
 
         /*
          * Second dirty check: bhyve_vcpu_pre_run may have processed
@@ -1513,69 +1392,212 @@ static int bhyve_vcpu_run(CPUState *cpu) {
             qcpu->dirty = false;
         }
 
-		error = vm_run(qcpu->vcpu, &vmrun);
-		{
-		    static int vmrun_log = 0;
-		    static long port402_count = 0;
-		    if (error == 0) {
-		        int interesting = 0;
-		        if (vme.exitcode == VM_EXITCODE_INOUT && vme.u.inout.port == 0x402) {
-		            port402_count++;
-		            /* Log port 0x402 summary every 100K */
-		            if ((port402_count % 100000) == 0) {
-		                fprintf(stderr, "vm_run[%d] #%ld: port 0x402 count=%ld\n",
-		                        cpu->cpu_index, vm_run_total, port402_count);
-		                fflush(stderr);
-		            }
-		        } else if (vme.exitcode == VM_EXITCODE_INOUT) {
-		            if (vmrun_log < 200) {
-		                fprintf(stderr, "vm_run[%d] #%ld: INOUT port=0x%x %s rip=0x%lx\n",
-		                        cpu->cpu_index, vm_run_total,
-		                        vme.u.inout.port,
-		                        vme.u.inout.in ? "IN" : "OUT",
-		                        (unsigned long)vme.rip);
-		                fflush(stderr);
-		                vmrun_log++;
-		            }
-		        } else if (vmrun_log < 200) {
-		            /* Log non-INOUT, non-port402 exits (limited) */
-		            fprintf(stderr, "vm_run[%d] #%ld: exit=%d rip=0x%lx\n",
-		                    cpu->cpu_index, vm_run_total, vme.exitcode,
-		                    (unsigned long)vme.rip);
-		            fflush(stderr);
-		            vmrun_log++;
-		        }
-		    }
-		}
-		vm_run_total++;
-		if ((vm_run_total % 1000000) == 0) {
-		    mmio_print_stats();
-		}
-
-        /* Per-CPU periodic stats (every 5 seconds wall clock) */
+        /*
+         * Scrub bad vectors from in-kernel LAPIC IRR, but ONLY when
+         * the guest is in kernel space. During UEFI, vectors 32 and 64
+         * are legitimate timer interrupts that UEFI needs to make progress.
+         * In the FreeBSD kernel, those same vectors have no IDT handler
+         * (Xrsvd) and cause trap 30.
+         */
         {
-            static __thread long cpu_runs = 0;
-            static __thread long cpu_hlt = 0;
-            static __thread long cpu_inst_emul = 0;
-            static __thread long cpu_inout = 0;
-            static __thread int64_t last_report_ms = 0;
-            cpu_runs++;
-            if (error == 0) {
-                if (vme.exitcode == VM_EXITCODE_HLT) cpu_hlt++;
-                else if (vme.exitcode == VM_EXITCODE_INST_EMUL) cpu_inst_emul++;
-                else if (vme.exitcode == VM_EXITCODE_INOUT ||
-                         vme.exitcode == VM_EXITCODE_INOUT_STR) cpu_inout++;
+            uint64_t scrub_rip = 0;
+            vm_get_register(qcpu->vcpu, VM_REG_GUEST_RIP, &scrub_rip);
+            if (scrub_rip >= 0xffffffff80000000ULL) {
+                scrub_lapic_bad_vectors(qcpu->vcpu);
             }
-            int64_t now_ms = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
-            if (last_report_ms == 0) last_report_ms = now_ms;
-            if (now_ms - last_report_ms >= 5000) {
-                fprintf(stderr, "CPU_STATS[%d] t=%lds: runs=%ld hlt=%ld inst_emul=%ld inout=%ld\n",
-                        cpu->cpu_index,
-                        (long)((now_ms - last_report_ms) / 1000),
-                        cpu_runs, cpu_hlt, cpu_inst_emul, cpu_inout);
-                fflush(stderr);
-                cpu_runs = cpu_hlt = cpu_inst_emul = cpu_inout = 0;
-                last_report_ms = now_ms;
+        }
+
+        /*
+         * MASK_HWINTR safety net: prevent the bhyve kernel from injecting
+         * hardware interrupts during early FreeBSD kernel boot.
+         *
+         * During mi_startup, IF=0 (interrupts disabled). The vLAPIC IRR
+         * accumulates pending vectors (e.g., PIT timer via IOAPIC).
+         * When intr_init_final executes STI (IF→1), the kernel's
+         * vmx_inject_interrupts would deliver those IRR vectors immediately.
+         * If the guest IDT still has Xrsvd handlers for those vectors,
+         * the guest panics with trap 30.
+         *
+         * Strategy:
+         * - When guest is in kernel long mode with IF=0: set MASK_HWINTR
+         * - When guest transitions IF 0→1 (after STI): keep MASK_HWINTR
+         *   for a grace period to let more IDT handlers be installed
+         * - After grace period: clear MASK_HWINTR, allow interrupts
+         */
+        {
+            static int hwintr_state = 0;  /* 0=off, 1=masked, 2=grace, 3=done */
+            static long grace_start = 0;
+
+            uint64_t pre_rip = 0, pre_rflags = 0;
+            vm_get_register(qcpu->vcpu, VM_REG_GUEST_RIP, &pre_rip);
+            vm_get_register(qcpu->vcpu, VM_REG_GUEST_RFLAGS, &pre_rflags);
+            int guest_if = (pre_rflags >> 9) & 1;
+
+            int in_kernel = (pre_rip >= 0xffffffff80000000ULL);
+
+            if (hwintr_state == 0 && in_kernel && !guest_if) {
+                /* Guest entered kernel with IF=0 — mask interrupts */
+                vm_set_capability(qcpu->vcpu, VM_CAP_MASK_HWINTR, 1);
+                hwintr_state = 1;
+                fprintf(stderr, "*** MASK_HWINTR: enabled (kernel IF=0, RIP=0x%lx)\n",
+                        (unsigned long)pre_rip);
+            } else if (hwintr_state == 1 && guest_if && in_kernel) {
+                /*
+                 * Guest did STI in kernel mode — scrub ALL stale IRR
+                 * vectors and immediately unmask. The guest needs
+                 * interrupts for disk I/O (root mount), but stale
+                 * PIC/IOAPIC vectors in IRR would cause trap 30.
+                 * After scrub, fresh interrupts use properly-configured
+                 * IOAPIC vectors with installed IDT handlers.
+                 */
+                struct vm_lapic_state unmask_lapic;
+                memset(&unmask_lapic, 0, sizeof(unmask_lapic));
+                if (vcpu_ioctl(qcpu->vcpu, VM_LAPIC_GET_STATE, &unmask_lapic) == 0) {
+                    for (int i = 0; i < 8; i++) {
+                        if (unmask_lapic.fields[0x20 + i].data != 0) {
+                            fprintf(stderr, "*** MASK_HWINTR: scrubbing IRR[%d]"
+                                    "=0x%08x before unmask\n",
+                                    i, unmask_lapic.fields[0x20 + i].data);
+                            unmask_lapic.fields[0x20 + i].data = 0;
+                        }
+                    }
+                    vcpu_ioctl(qcpu->vcpu, VM_LAPIC_SET_STATE, &unmask_lapic);
+                }
+                vm_set_capability(qcpu->vcpu, VM_CAP_MASK_HWINTR, 0);
+                hwintr_state = 3;
+                fprintf(stderr, "*** MASK_HWINTR: scrubbed + disabled at IF=1 "
+                        "(run #%ld, RIP=0x%lx)\n",
+                        vm_run_total, (unsigned long)pre_rip);
+            }
+        }
+
+        /* Targeted LAPIC dump when RIP is near intr_init_final (0xffffffff810411f0) */
+        {
+            uint64_t pre_rip = 0;
+            vm_get_register(qcpu->vcpu, VM_REG_GUEST_RIP, &pre_rip);
+            if (pre_rip >= 0xffffffff81041100 && pre_rip <= 0xffffffff81041210) {
+                static int dump_done = 0;
+                if (!dump_done) {
+                    dump_done = 1;
+                    fprintf(stderr, "\n*** INTR_INIT_FINAL REACHED: RIP=0x%lx (run #%ld)\n",
+                            (unsigned long)pre_rip, vm_run_total);
+
+                    /* Read RFLAGS to check IF */
+                    uint64_t rflags = 0;
+                    vm_get_register(qcpu->vcpu, VM_REG_GUEST_RFLAGS, &rflags);
+                    fprintf(stderr, "  RFLAGS=0x%lx IF=%d\n",
+                            (unsigned long)rflags, (int)((rflags >> 9) & 1));
+
+                    /* Dump full LAPIC state */
+                    struct vm_lapic_state ls;
+                    memset(&ls, 0, sizeof(ls));
+                    if (vcpu_ioctl(qcpu->vcpu, VM_LAPIC_GET_STATE, &ls) == 0) {
+                        fprintf(stderr, "  LAPIC state:\n");
+                        /* IRR: indices 0x20-0x27 (8 regs × 32 bits = 256 vectors) */
+                        for (int i = 0; i < 8; i++) {
+                            uint32_t irr = ls.fields[0x20 + i].data;
+                            if (irr != 0) {
+                                fprintf(stderr, "    IRR[%d] (vec %d-%d) = 0x%08x\n",
+                                        i, i*32, i*32+31, irr);
+                            }
+                        }
+                        /* ISR: indices 0x10-0x17 */
+                        for (int i = 0; i < 8; i++) {
+                            uint32_t isr = ls.fields[0x10 + i].data;
+                            if (isr != 0) {
+                                fprintf(stderr, "    ISR[%d] (vec %d-%d) = 0x%08x\n",
+                                        i, i*32, i*32+31, isr);
+                            }
+                        }
+                        /* LVT Timer: index 0x32 */
+                        fprintf(stderr, "    LVT_Timer = 0x%08x (vec=%d masked=%d)\n",
+                                ls.fields[0x32].data,
+                                ls.fields[0x32].data & 0xFF,
+                                (ls.fields[0x32].data >> 16) & 1);
+                        /* LVT LINT0/1: indices 0x35/0x36 */
+                        fprintf(stderr, "    LVT_LINT0 = 0x%08x\n", ls.fields[0x35].data);
+                        fprintf(stderr, "    LVT_LINT1 = 0x%08x\n", ls.fields[0x36].data);
+                        /* TPR: index 0x08 */
+                        fprintf(stderr, "    TPR = 0x%08x\n", ls.fields[0x08].data);
+                        /* SVR: index 0x0F */
+                        fprintf(stderr, "    SVR = 0x%08x\n", ls.fields[0x0F].data);
+                    } else {
+                        fprintf(stderr, "  LAPIC GET_STATE failed: errno=%d\n", errno);
+                    }
+
+                    /* Check intinfo (pending VMCS injection) */
+                    uint64_t info1 = 0, info2 = 0;
+                    if (vm_get_intinfo(qcpu->vcpu, &info1, &info2) == 0) {
+                        fprintf(stderr, "  INTINFO: info1=0x%lx info2=0x%lx",
+                                (unsigned long)info1, (unsigned long)info2);
+                        if (info1 & (1ULL << 31)) {
+                            fprintf(stderr, " [VALID vec=%d type=%d]",
+                                    (int)(info1 & 0xFF),
+                                    (int)((info1 >> 8) & 7));
+                        }
+                        fprintf(stderr, "\n");
+                    }
+                }
+            }
+        }
+
+		error = vm_run(qcpu->vcpu, &vmrun);
+		vm_run_total++;
+
+        /* Ring buffer: last 4096 exits before crash for post-mortem */
+        {
+            #define EXIT_RING_SIZE 4096
+            #define EXIT_RING_MASK (EXIT_RING_SIZE - 1)
+            static struct {
+                int exitcode; uint64_t rip; uint32_t port; long count;
+                uint64_t cr4; uint8_t dirty;
+            } last_exits[EXIT_RING_SIZE];
+            static int exit_idx = 0;
+            int ri = exit_idx & EXIT_RING_MASK;
+            last_exits[ri].exitcode = vme.exitcode;
+            last_exits[ri].rip = vme.rip;
+            last_exits[ri].port = (vme.exitcode == VM_EXITCODE_INOUT) ? vme.u.inout.port : 0;
+            last_exits[ri].count = vm_run_total;
+            last_exits[ri].dirty = qcpu->dirty ? 1 : 0;
+            /* Read CR4 from VMCS for corruption detection */
+            {
+                uint64_t cr4_val = 0;
+                vm_get_register(qcpu->vcpu, VM_REG_GUEST_CR4, &cr4_val);
+                last_exits[ri].cr4 = cr4_val;
+            }
+            exit_idx++;
+
+            /* Dump ring buffer on: VMX error, SUSPENDED, or unknown exit */
+            bool do_dump = (vme.exitcode == VM_EXITCODE_VMX ||
+                            vme.exitcode == VM_EXITCODE_SUSPENDED);
+            if (!do_dump &&
+                vme.exitcode != VM_EXITCODE_INOUT &&
+                vme.exitcode != VM_EXITCODE_BOGUS &&
+                vme.exitcode != VM_EXITCODE_HLT &&
+                vme.exitcode != VM_EXITCODE_RDMSR &&
+                vme.exitcode != VM_EXITCODE_WRMSR &&
+                vme.exitcode != VM_EXITCODE_INST_EMUL &&
+                vme.exitcode != VM_EXITCODE_PAUSE &&
+                vme.exitcode != VM_EXITCODE_REQIDLE &&
+                vme.exitcode != VM_EXITCODE_INOUT_STR &&
+                vme.exitcode != VM_EXITCODE_IPI &&
+                vme.exitcode != VM_EXITCODE_SPINUP_AP &&
+                vme.exitcode != VM_EXITCODE_IOAPIC_EOI) {
+                do_dump = true;
+            }
+            if (do_dump) {
+                /* Print last 200 entries (not all 4096) to keep output manageable */
+                int dump_count = (exit_idx < 200) ? exit_idx : 200;
+                fprintf(stderr, "\n=== EXIT %d at rip=0x%lx (run #%ld) ===\n",
+                        vme.exitcode, (unsigned long)vme.rip, vm_run_total);
+                fprintf(stderr, "Last %d exits:\n", dump_count);
+                for (int i = 0; i < dump_count; i++) {
+                    int j = (exit_idx - dump_count + i) & EXIT_RING_MASK;
+                    fprintf(stderr, "  [%ld] exit=%d rip=0x%lx port=0x%x cr4=0x%lx d=%d\n",
+                            last_exits[j].count, last_exits[j].exitcode,
+                            (unsigned long)last_exits[j].rip, last_exits[j].port,
+                            (unsigned long)last_exits[j].cr4, last_exits[j].dirty);
+                }
             }
         }
 
@@ -1584,7 +1606,6 @@ static int bhyve_vcpu_run(CPUState *cpu) {
             if (vm_run_err_log < 5) {
                 fprintf(stderr, "Error running vm: %s (errno=%d, error=%d)\n",
                         strerror(errno), errno, error);
-                fflush(stderr);
                 vm_run_err_log++;
             }
             rc = 1;
@@ -1595,19 +1616,15 @@ static int bhyve_vcpu_run(CPUState *cpu) {
 
 		exitcode = vme.exitcode;
 
-        /* Minimal exit logging - only HLT exits for now */
-
         switch (exitcode) {
         case VM_EXITCODE_HLT:
             exit_hlt++;
             {
-                static int hlt_log = 0;
-
                 /*
                  * Precise LAPIC timer wakeup for HLT exits.
                  *
                  * 1. Read kernel vLAPIC state
-                 * 2. If IRR has pending bits → skip halt, re-enter immediately
+                 * 2. If IRR has pending bits -> skip halt, re-enter immediately
                  * 3. Otherwise compute exact LAPIC timer deadline from CCR/DCR
                  * 4. Arm host timer for that precise moment
                  */
@@ -1626,24 +1643,9 @@ static int bhyve_vcpu_run(CPUState *cpu) {
                 }
 
                 if (irr_pending) {
-                    /* Interrupt already pending — re-enter VM immediately.
+                    /* Interrupt already pending -- re-enter VM immediately.
                      * The kernel will inject it on the next VMX entry. */
-                    if (hlt_log < 20) {
-                        fprintf(stderr, "HLT[%d]: IRR pending, skip halt → re-enter\n",
-                                cpu->cpu_index);
-                        fflush(stderr);
-                        hlt_log++;
-                    }
-                    /* Don't set halted — just continue the vm_run loop */
                     break;
-                }
-
-                /* No pending interrupt. Compute LAPIC timer deadline. */
-                if (hlt_log < 20) {
-                    fprintf(stderr, "HLT[%d]: cpu=%d rip=0x%lx, computing timer deadline\n",
-                            hlt_log, cpu->cpu_index, (unsigned long)vme.rip);
-                    fflush(stderr);
-                    hlt_log++;
                 }
 
                 cpu->halted = true;
@@ -1673,12 +1675,6 @@ static int bhyve_vcpu_run(CPUState *cpu) {
                         default:   divisor = 1; break;
                         }
 
-                        /*
-                         * Time until next LAPIC timer fire:
-                         *   CCR * divisor / VLAPIC_BUS_FREQ  (seconds)
-                         * Convert to nanoseconds:
-                         *   CCR * divisor * 1e9 / (128 * 1024 * 1024)
-                         */
                         uint64_t ccr64 = ccr;
                         uint64_t div64 = divisor;
                         deadline_ns = (int64_t)((ccr64 * div64 * 1000000000ULL)
@@ -1690,15 +1686,6 @@ static int bhyve_vcpu_run(CPUState *cpu) {
                             deadline_ns = 100000;
                         if (deadline_ns > 50000000)
                             deadline_ns = 50000000;
-
-                        static int deadline_log = 0;
-                        if (deadline_log < 20) {
-                            fprintf(stderr, "HLT[%d]: LAPIC timer: ccr=%u icr=%u dcr=0x%x div=%u → %ld ns\n",
-                                    cpu->cpu_index, ccr, icr, dcr, divisor,
-                                    (long)deadline_ns);
-                            fflush(stderr);
-                            deadline_log++;
-                        }
                     }
                 }
 
@@ -1720,13 +1707,103 @@ static int bhyve_vcpu_run(CPUState *cpu) {
             break;
         case VM_EXITCODE_DEBUG:
             exit_debug++;
+            {
+                uint64_t dbg_rip = vme.rip;
+                uint64_t dbg_dr0 = 0, dbg_dr6 = 0, dbg_dr7 = 0, dbg_rflags = 0;
+                vm_get_register(qcpu->vcpu, VM_REG_GUEST_DR0, &dbg_dr0);
+                vm_get_register(qcpu->vcpu, VM_REG_GUEST_DR6, &dbg_dr6);
+                vm_get_register(qcpu->vcpu, VM_REG_GUEST_DR7, &dbg_dr7);
+                vm_get_register(qcpu->vcpu, VM_REG_GUEST_RFLAGS, &dbg_rflags);
+                fprintf(stderr, "\n*** DEBUG EXIT: RIP=0x%lx (run #%ld) "
+                        "DR0=0x%lx DR6=0x%lx DR7=0x%lx RFLAGS=0x%lx\n",
+                        (unsigned long)dbg_rip, vm_run_total,
+                        (unsigned long)dbg_dr0, (unsigned long)dbg_dr6,
+                        (unsigned long)dbg_dr7, (unsigned long)dbg_rflags);
+
+                /* If this is our intr_init_final breakpoint, dump and scrub IRR */
+                if (dbg_rip >= 0xffffffff810411f0 &&
+                    dbg_rip <= 0xffffffff810411f6) {
+                    fprintf(stderr, "  === INTR_INIT_FINAL BREAKPOINT HIT ===\n");
+
+                    /* Read RFLAGS */
+                    uint64_t rflags = 0;
+                    vm_get_register(qcpu->vcpu, VM_REG_GUEST_RFLAGS, &rflags);
+                    fprintf(stderr, "  RFLAGS=0x%lx IF=%d\n",
+                            (unsigned long)rflags, (int)((rflags >> 9) & 1));
+
+                    /* Dump and scrub full LAPIC state */
+                    struct vm_lapic_state dbg_lapic;
+                    memset(&dbg_lapic, 0, sizeof(dbg_lapic));
+                    if (vcpu_ioctl(qcpu->vcpu, VM_LAPIC_GET_STATE, &dbg_lapic) == 0) {
+                        int any_irr = 0;
+                        fprintf(stderr, "  LAPIC IRR (pending vectors):\n");
+                        for (int i = 0; i < 8; i++) {
+                            uint32_t irr = dbg_lapic.fields[0x20 + i].data;
+                            if (irr != 0) {
+                                any_irr = 1;
+                                fprintf(stderr, "    IRR[%d] (vec %d-%d) = 0x%08x",
+                                        i, i*32, i*32+31, irr);
+                                /* List individual vectors */
+                                for (int b = 0; b < 32; b++) {
+                                    if (irr & (1u << b))
+                                        fprintf(stderr, " vec=%d", i*32+b);
+                                }
+                                fprintf(stderr, "\n");
+                            }
+                        }
+                        if (!any_irr)
+                            fprintf(stderr, "    (no pending vectors)\n");
+
+                        /* ISR */
+                        for (int i = 0; i < 8; i++) {
+                            uint32_t isr = dbg_lapic.fields[0x10 + i].data;
+                            if (isr != 0)
+                                fprintf(stderr, "    ISR[%d] (vec %d-%d) = 0x%08x\n",
+                                        i, i*32, i*32+31, isr);
+                        }
+
+                        /* LVT Timer, LINT0, LINT1, SVR */
+                        fprintf(stderr, "    LVT_Timer=0x%08x (vec=%d masked=%d)\n",
+                                dbg_lapic.fields[0x32].data,
+                                dbg_lapic.fields[0x32].data & 0xFF,
+                                (dbg_lapic.fields[0x32].data >> 16) & 1);
+                        fprintf(stderr, "    LVT_LINT0=0x%08x LVT_LINT1=0x%08x\n",
+                                dbg_lapic.fields[0x35].data,
+                                dbg_lapic.fields[0x36].data);
+                        fprintf(stderr, "    SVR=0x%08x TPR=0x%08x\n",
+                                dbg_lapic.fields[0x0F].data,
+                                dbg_lapic.fields[0x08].data);
+
+                        /*
+                         * SCRUB: clear ALL pending IRR vectors.
+                         * At this point the guest is about to do STI.
+                         * Any pending vector whose IDT entry is Xrsvd
+                         * will cause trap 30. We clear all IRR and let
+                         * the guest re-request interrupts after IDT setup.
+                         */
+                        int scrubbed = 0;
+                        for (int i = 0; i < 8; i++) {
+                            if (dbg_lapic.fields[0x20 + i].data != 0) {
+                                fprintf(stderr, "  SCRUB: clearing IRR[%d] = 0x%08x\n",
+                                        i, dbg_lapic.fields[0x20 + i].data);
+                                dbg_lapic.fields[0x20 + i].data = 0;
+                                scrubbed = 1;
+                            }
+                        }
+                        if (scrubbed) {
+                            vcpu_ioctl(qcpu->vcpu, VM_LAPIC_SET_STATE, &dbg_lapic);
+                            fprintf(stderr, "  SCRUB: all IRR cleared, SET_STATE done\n");
+                        }
+                    }
+
+                    /* Clear DR0/DR7 — breakpoint no longer needed */
+                    vm_set_register(qcpu->vcpu, VM_REG_GUEST_DR0, 0);
+                    vm_set_register(qcpu->vcpu, VM_REG_GUEST_DR7, 0);
+                    fprintf(stderr, "  DR0/DR7 cleared, resuming guest\n");
+                }
+            }
             /* Clear debug state so next vm_run doesn't exit immediately */
             vm_resume_cpu(qcpu->vcpu);
-            if (exit_debug <= 5) {
-                fprintf(stderr, "DEBUG EXIT #%ld: rip=0x%lx (resume_rc=%d)\n",
-                        exit_debug, (unsigned long)vme.rip,
-                        vm_resume_cpu(qcpu->vcpu));
-            }
             break;
         case VM_EXITCODE_INOUT:
         case VM_EXITCODE_INOUT_STR:
@@ -1742,48 +1819,6 @@ static int bhyve_vcpu_run(CPUState *cpu) {
             break;
         case VM_EXITCODE_INST_EMUL:
             bql_lock();
-            {
-                static uint64_t inst_emul_total = 0;
-                static uint64_t inst_emul_lapic = 0;
-                static uint64_t inst_emul_ioapic = 0;
-                static uint64_t inst_emul_hpet = 0;
-                static uint64_t inst_emul_other = 0;
-                static int inst_emul_log = 0;
-                uint64_t gpa_pre = vme.u.inst_emul.gpa;
-
-                inst_emul_total++;
-                if (gpa_pre >= 0xFEE00000ULL && gpa_pre < 0xFEF00000ULL)
-                    inst_emul_lapic++;
-                else if (gpa_pre >= 0xFEC00000ULL && gpa_pre < 0xFED00000ULL)
-                    inst_emul_ioapic++;
-                else if (gpa_pre >= 0xFED00000ULL && gpa_pre < 0xFEE00000ULL)
-                    inst_emul_hpet++;
-                else
-                    inst_emul_other++;
-
-                /* Log first 50 individual accesses */
-                if (inst_emul_log < 50) {
-                    fprintf(stderr, "INST_EMUL[%d]: gpa=0x%lx rip=0x%lx inst[0..3]=%02x %02x %02x %02x\n",
-                            cpu->cpu_index, (unsigned long)gpa_pre,
-                            (unsigned long)vme.rip,
-                            vme.u.inst_emul.vie.inst[0],
-                            vme.u.inst_emul.vie.inst[1],
-                            vme.u.inst_emul.vie.inst[2],
-                            vme.u.inst_emul.vie.inst[3]);
-                    fflush(stderr);
-                    inst_emul_log++;
-                }
-                /* Periodic summary every 10000 exits */
-                if ((inst_emul_total % 10000) == 0) {
-                    fprintf(stderr, "INST_EMUL STATS: total=%lu lapic=%lu ioapic=%lu hpet=%lu other=%lu\n",
-                            (unsigned long)inst_emul_total,
-                            (unsigned long)inst_emul_lapic,
-                            (unsigned long)inst_emul_ioapic,
-                            (unsigned long)inst_emul_hpet,
-                            (unsigned long)inst_emul_other);
-                    fflush(stderr);
-                }
-            }
             rc = vm_assist_qmem(qcpu->vcpu, vmm_mem_callback, &vme);
             if (rc == 0) {
                 mmio_kernel_ok++;
@@ -1796,16 +1831,7 @@ static int bhyve_vcpu_run(CPUState *cpu) {
                  */
                 struct vie *vie = &vme.u.inst_emul.vie;
                 uint64_t gpa = vme.u.inst_emul.gpa;
-                static int mmio_emul_log = 0;
-
                 if (vie->num_valid == 0) {
-                    if (mmio_emul_log < 10) {
-                        fprintf(stderr, "MMIO EMUL[%d]: no instruction bytes at "
-                                "gpa=0x%lx rip=0x%lx (skipping)\n",
-                                cpu->cpu_index,
-                                (unsigned long)gpa, (unsigned long)vme.rip);
-                        mmio_emul_log++;
-                    }
                     bql_unlock();
                     rc = 0; /* Reset rc (was set by vm_assist_qmem) so
                              * the while loop continues. */
@@ -1985,17 +2011,6 @@ static int bhyve_vcpu_run(CPUState *cpu) {
                         regval = v; /* 32-bit zero-extends */
                     }
                     vm_set_register(qcpu->vcpu, reg_map[reg_field], regval);
-
-                    if (mmio_emul_log < 5) {
-                        fprintf(stderr, "MMIO READ: gpa=0x%lx size=%d "
-                                "val=0x%lx → reg%d (inst_len=%d)\n",
-                                (unsigned long)gpa, op_size,
-                                (unsigned long)(op_size == 1 ? data[0] :
-                                 op_size == 2 ? *(uint16_t*)data :
-                                 *(uint32_t*)data),
-                                reg_field, inst_len);
-                        mmio_emul_log++;
-                    }
                 } else if (is_write == 1 && reg_field >= 0 && op_size > 0) {
                     /* MMIO WRITE: read from guest register, write to device */
                     mmio_user_write++;
@@ -2010,17 +2025,6 @@ static int bhyve_vcpu_run(CPUState *cpu) {
                     address_space_rw(&address_space_memory, gpa,
                                      MEMTXATTRS_UNSPECIFIED,
                                      data, op_size, true);
-
-                    if (mmio_emul_log < 50) {
-                        fprintf(stderr, "MMIO WRITE: gpa=0x%lx size=%d "
-                                "val=0x%lx from reg%d\n",
-                                (unsigned long)gpa, op_size,
-                                (unsigned long)(op_size == 1 ? data[0] :
-                                 op_size == 2 ? *(uint16_t*)data :
-                                 *(uint32_t*)data),
-                                reg_field);
-                        mmio_emul_log++;
-                    }
                 } else if (is_write == 2 && op_size > 0) {
                     /* MMIO WRITE from immediate value */
                     mmio_user_write++;
@@ -2031,30 +2035,9 @@ static int bhyve_vcpu_run(CPUState *cpu) {
                     address_space_rw(&address_space_memory, gpa,
                                      MEMTXATTRS_UNSPECIFIED,
                                      data, op_size, true);
-
-                    if (mmio_emul_log < 10) {
-                        fprintf(stderr, "MMIO WRITE IMM: gpa=0x%lx size=%d "
-                                "val=0x%lx\n",
-                                (unsigned long)gpa, op_size,
-                                (unsigned long)(op_size == 1 ? data[0] :
-                                 op_size == 2 ? *(uint16_t*)data :
-                                 *(uint32_t*)data));
-                        mmio_emul_log++;
-                    }
                 } else {
-                    /* Can't decode — log and skip (old behavior) */
+                    /* Can't decode — skip */
                     mmio_user_skip++;
-                    if (mmio_emul_log < 20) {
-                        fprintf(stderr, "MMIO SKIP: gpa=0x%lx rip=0x%lx "
-                                "opcode=0x%02x inst:",
-                                (unsigned long)gpa, (unsigned long)vme.rip,
-                                opcode);
-                        for (int j = 0; j < vie->num_valid && j < 15; j++)
-                            fprintf(stderr, " %02x", vie->inst[j]);
-                        fprintf(stderr, "\n");
-                        fflush(stderr);
-                        mmio_emul_log++;
-                    }
                 }
 
                 vm_set_register(qcpu->vcpu, VM_REG_GUEST_RIP,
@@ -2066,58 +2049,30 @@ static int bhyve_vcpu_run(CPUState *cpu) {
         case VM_EXITCODE_RDMSR:
             rc = bhyve_rdmsr(qcpu->vcpu, &vme);
             if (rc) {
-                printf("Error Reading to MSR...\n");
+                static int msr_rd_err = 0;
+                if (msr_rd_err < 5) {
+                    fprintf(stderr, "bhyve: rdmsr error, msr=0x%x\n",
+                            vme.u.msr.code);
+                    msr_rd_err++;
+                }
                 continue;
             }
             break;
         case VM_EXITCODE_WRMSR:
             rc = bhyve_wrmsr(&vme);
             if (rc) {
-                printf("Error Writing to MSR...\n");
+                static int msr_wr_err = 0;
+                if (msr_wr_err < 5) {
+                    fprintf(stderr, "bhyve: wrmsr error, msr=0x%x\n",
+                            vme.u.msr.code);
+                    msr_wr_err++;
+                }
                 continue;
             }
             break;
         case VM_EXITCODE_BOGUS:
-        case 20: /* VM_EXITCODE_REQIDLE — scheduler yield, just re-enter */
+        case 20: /* VM_EXITCODE_REQIDLE -- scheduler yield, just re-enter */
             exit_bogus++;
-            /* AP diagnostic: log RFLAGS and code at stuck RIP */
-            if (cpu->cpu_index > 0) {
-                static int ap_bogus_log = 0;
-                if (ap_bogus_log < 3) {
-                    uint64_t ap_rflags = 0, ap_rip_k = 0, ap_cr3 = 0, ap_rsp = 0, ap_rdx = 0, ap_rax = 0;
-                    vm_get_register(qcpu->vcpu, VM_REG_GUEST_RFLAGS, &ap_rflags);
-                    vm_get_register(qcpu->vcpu, VM_REG_GUEST_RIP, &ap_rip_k);
-                    vm_get_register(qcpu->vcpu, VM_REG_GUEST_CR3, &ap_cr3);
-                    vm_get_register(qcpu->vcpu, VM_REG_GUEST_RSP, &ap_rsp);
-                    vm_get_register(qcpu->vcpu, VM_REG_GUEST_RDX, &ap_rdx);
-                    vm_get_register(qcpu->vcpu, VM_REG_GUEST_RAX, &ap_rax);
-                    fprintf(stderr, "AP_BOGUS[%d] #%d: rip=0x%lx rflags=0x%lx IF=%d cr3=0x%lx rsp=0x%lx rdx=0x%lx rax=0x%lx\n",
-                            cpu->cpu_index, ap_bogus_log,
-                            (unsigned long)ap_rip_k, (unsigned long)ap_rflags,
-                            (int)((ap_rflags >> 9) & 1),
-                            (unsigned long)ap_cr3, (unsigned long)ap_rsp,
-                            (unsigned long)ap_rdx, (unsigned long)ap_rax);
-                    /* Try to read code at physical address (for kernel with nokaslr:
-                     * virt 0xffffffff81XXXXXX → phys 0x01XXXXXX) */
-                    if (ap_rip_k >= 0xffffffff81000000ULL && ap_rip_k < 0xffffffff82000000ULL) {
-                        uint64_t phys = (ap_rip_k - 0xffffffff80000000ULL) - 16; /* dump 16 bytes before RIP */
-                        char *baseaddr;
-                        struct bhyve_machine *mach_tmp = get_bhyve_mach();
-                        size_t low_sz, high_sz;
-                        if (vm_get_guestmem_from_ctx(mach_tmp->vm, &baseaddr, &low_sz, &high_sz) == 0 && phys < low_sz) {
-                            uint8_t *code = (uint8_t *)(baseaddr + phys);
-                            fprintf(stderr, "AP[%d] code at phys 0x%lx (rip-16):", cpu->cpu_index, (unsigned long)phys);
-                            for (int ci = 0; ci < 48; ci++) {
-                                if (ci % 16 == 0) fprintf(stderr, "\n  %04x:", ci);
-                                fprintf(stderr, " %02x", code[ci]);
-                            }
-                            fprintf(stderr, "\n");
-                        }
-                    }
-                    fflush(stderr);
-                    ap_bogus_log++;
-                }
-            }
             /* Run timers periodically on BOGUS/REQIDLE exits too */
             if ((exit_bogus % 100) == 0) {
                 bql_lock();
@@ -2134,28 +2089,11 @@ static int bhyve_vcpu_run(CPUState *cpu) {
                 timer_mod_ns(qcpu->lapic_poll_timer,
                              qemu_clock_get_ns(QEMU_CLOCK_REALTIME) + 5000000);
             }
-            /* BSP: periodically read the AP's cpuhp state from guest memory */
-            if (cpu->cpu_index == 0) {
-                static int bsp_cpuhp_log = 0;
-                if (bsp_cpuhp_log < 10) {
-                    /* AP's ap_sync_state at phys 0x3bc213d8 */
-                    char *baseaddr;
-                    struct bhyve_machine *mach_tmp = get_bhyve_mach();
-                    size_t low_sz, high_sz;
-                    if (vm_get_guestmem_from_ctx(mach_tmp->vm, &baseaddr, &low_sz, &high_sz) == 0) {
-                        uint32_t *ap_state = (uint32_t *)(baseaddr + 0x3bc213d8ULL);
-                        if (0x3bc213d8ULL < low_sz) {
-                            fprintf(stderr, "BSP_CPUHP_CHECK: phys 0x3bc213d8 = %d (AP wants 4)\n",
-                                    *ap_state);
-                            fflush(stderr);
-                        }
-                    }
-                    bsp_cpuhp_log++;
-                }
-            }
             break;
         case VM_EXITCODE_SUSPENDED:
             how = vme.u.suspended.how;
+            fprintf(stderr, "VM_EXITCODE_SUSPENDED: how=%d (run #%ld, rip=0x%lx)\n",
+                    how, vm_run_total, (unsigned long)vme.rip);
 
             switch (how) {
             case VM_SUSPEND_RESET:
@@ -2164,6 +2102,14 @@ static int bhyve_vcpu_run(CPUState *cpu) {
                 qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
                 cpu->exception_index = EXCP_INTERRUPT;
                 vm_destroy(mach->vm);
+                rc = 1;
+                break;
+            case VM_SUSPEND_HALT:
+                /* Treat halt-suspend as non-fatal — just re-enter */
+                break;
+            case VM_SUSPEND_TRIPLEFAULT:
+                fprintf(stderr, "VM triple fault at rip=0x%lx\n",
+                        (unsigned long)vme.rip);
                 rc = 1;
                 break;
             default:
@@ -2180,6 +2126,98 @@ static int bhyve_vcpu_run(CPUState *cpu) {
                 vmx_err_log++;
             }
             dump_registers(qcpu->vcpu);
+            /*
+             * Dump guest IDT entries to debug trap 30.
+             * Read IDTR and CR3, do 4-level page walk to find IDT phys addr,
+             * then read IDT entries for vectors 30 and 64.
+             */
+            {
+                uint64_t idtr_base = 0, cr3 = 0;
+                size_t idtr_base_sz = sizeof(idtr_base);
+                size_t cr3_sz = sizeof(cr3);
+                vm_get_register(qcpu->vcpu, VM_REG_GUEST_IDTR, &idtr_base);
+                vm_get_register(qcpu->vcpu, VM_REG_GUEST_CR3, &cr3);
+                fprintf(stderr, "IDT_DUMP: IDTR_BASE=0x%lx CR3=0x%lx\n",
+                        (unsigned long)idtr_base, (unsigned long)cr3);
+
+                /* 4-level page walk: translate IDTR virtual addr to physical */
+                if (cr3 != 0 && idtr_base != 0) {
+                    uint64_t va = idtr_base;
+                    uint64_t pml4e, pdpte, pde, pte;
+                    uint64_t phys_addr = 0;
+                    int walk_ok = 0;
+
+                    /* PML4 entry */
+                    uint64_t pml4_idx = (va >> 39) & 0x1FF;
+                    cpu_physical_memory_read((cr3 & ~0xFFFULL) + pml4_idx * 8, &pml4e, 8);
+                    if (pml4e & 1) {
+                        /* PDPT entry */
+                        uint64_t pdpt_idx = (va >> 30) & 0x1FF;
+                        cpu_physical_memory_read((pml4e & 0x000FFFFFFFFFF000ULL) + pdpt_idx * 8, &pdpte, 8);
+                        if (pdpte & 1) {
+                            if (pdpte & 0x80) {
+                                /* 1GB page */
+                                phys_addr = (pdpte & 0x000FFFFFC0000000ULL) | (va & 0x3FFFFFFF);
+                                walk_ok = 1;
+                            } else {
+                                /* PD entry */
+                                uint64_t pd_idx = (va >> 21) & 0x1FF;
+                                cpu_physical_memory_read((pdpte & 0x000FFFFFFFFFF000ULL) + pd_idx * 8, &pde, 8);
+                                if (pde & 1) {
+                                    if (pde & 0x80) {
+                                        /* 2MB page */
+                                        phys_addr = (pde & 0x000FFFFFFFE00000ULL) | (va & 0x1FFFFF);
+                                        walk_ok = 1;
+                                    } else {
+                                        /* PT entry */
+                                        uint64_t pt_idx = (va >> 12) & 0x1FF;
+                                        cpu_physical_memory_read((pde & 0x000FFFFFFFFFF000ULL) + pt_idx * 8, &pte, 8);
+                                        if (pte & 1) {
+                                            phys_addr = (pte & 0x000FFFFFFFFFF000ULL) | (va & 0xFFF);
+                                            walk_ok = 1;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if (walk_ok) {
+                        fprintf(stderr, "IDT_DUMP: IDTR phys=0x%lx\n", (unsigned long)phys_addr);
+                        /* Read IDT entries — each is 16 bytes in long mode */
+                        int vecs[] = {0, 8, 13, 14, 30, 64, 0x20, 0x40};
+                        for (int vi = 0; vi < 8; vi++) {
+                            int vec = vecs[vi];
+                            uint8_t idt_entry[16];
+                            uint64_t entry_phys = phys_addr + (uint64_t)vec * 16;
+                            /* Adjust if crossing page boundary */
+                            uint64_t entry_va = idtr_base + (uint64_t)vec * 16;
+                            /* Re-walk if on different page than IDTR base */
+                            uint64_t use_phys = entry_phys; /* approximation: assume same 2MB/1GB page */
+                            if ((entry_va >> 12) != (idtr_base >> 12)) {
+                                /* Different page — need another walk, skip for now */
+                                use_phys = phys_addr - (idtr_base & 0xFFF) + (entry_va & 0xFFF)
+                                           + ((entry_va >> 12) - (idtr_base >> 12)) * 0x1000;
+                            }
+                            cpu_physical_memory_read(use_phys, idt_entry, 16);
+                            uint16_t off_lo = *(uint16_t *)&idt_entry[0];
+                            uint16_t seg = *(uint16_t *)&idt_entry[2];
+                            uint8_t ist = idt_entry[4] & 0x7;
+                            uint8_t type = (idt_entry[5] >> 0) & 0xF;
+                            uint8_t dpl = (idt_entry[5] >> 5) & 0x3;
+                            uint8_t present = (idt_entry[5] >> 7) & 0x1;
+                            uint16_t off_mid = *(uint16_t *)&idt_entry[6];
+                            uint32_t off_hi = *(uint32_t *)&idt_entry[8];
+                            uint64_t handler = ((uint64_t)off_hi << 32) | ((uint64_t)off_mid << 16) | off_lo;
+                            fprintf(stderr, "IDT[%3d]: handler=0x%016lx seg=0x%04x "
+                                    "type=%x dpl=%d p=%d ist=%d\n",
+                                    vec, (unsigned long)handler, seg, type, dpl, present, ist);
+                        }
+                    } else {
+                        fprintf(stderr, "IDT_DUMP: page walk FAILED\n");
+                    }
+                }
+            }
             rc = -1;
             break;
         }
@@ -2216,23 +2254,13 @@ static int bhyve_vcpu_run(CPUState *cpu) {
             uint32_t ipi_mode = vme.u.ipi.mode;
             uint8_t ipi_vector = vme.u.ipi.vector;
             int target_cpu;
-            static int ipi_log = 0;
-
-            if (ipi_log < 20) {
-                fprintf(stderr, "IPI: mode=0x%x vec=%d dmask targets:",
-                        ipi_mode, ipi_vector);
-            }
 
             bql_lock();
             CPU_FOREACH_ISSET(target_cpu, &dmask) {
                 CPUState *target_cs = qemu_get_cpu(target_cpu);
                 if (!target_cs) {
-                    if (ipi_log < 20)
-                        fprintf(stderr, " [%d:MISSING]", target_cpu);
                     continue;
                 }
-                if (ipi_log < 20)
-                    fprintf(stderr, " %d", target_cpu);
 
                 switch (ipi_mode) {
                 case APIC_DELMODE_INIT:
@@ -2242,8 +2270,6 @@ static int bhyve_vcpu_run(CPUState *cpu) {
                      * The kernel already called vm_await_start().
                      */
                     cpu_interrupt(target_cs, CPU_INTERRUPT_INIT);
-                    if (ipi_log < 20)
-                        fprintf(stderr, "(INIT)");
                     break;
                 case APIC_DELMODE_STARTUP: {
                     /*
@@ -2252,16 +2278,15 @@ static int bhyve_vcpu_run(CPUState *cpu) {
                      * do_cpu_init (cpu_reset + apic_init_reset) +
                      * do_cpu_sipi (cpu_x86_load_seg_cache_sipi).
                      *
-                     * DO NOT call vcpu_reset — let QEMU's cpu_reset
+                     * DO NOT call vcpu_reset -- let QEMU's cpu_reset
                      * set the definitive state, then vmm_set_registers
                      * syncs it to the kernel VMCS.
                      */
                     AccelCPUState *tqcpu = target_cs->accel;
                     X86CPU *target_x86 = X86_CPU(target_cs);
-                    int aerr;
 
                     /* Activate AP in kernel (idempotent) */
-                    aerr = vm_activate_cpu(tqcpu->vcpu);
+                    vm_activate_cpu(tqcpu->vcpu);
                     /* Suspend: bhyve_vcpu_exec will call vm_resume_cpu */
                     vm_suspend_cpu(tqcpu->vcpu);
 
@@ -2274,10 +2299,6 @@ static int bhyve_vcpu_run(CPUState *cpu) {
                     target_cs->halted = false;
                     target_cs->stopped = false;
                     tqcpu->dirty = true;
-
-                    if (ipi_log < 20)
-                        fprintf(stderr, "(SIPI:act=%d,vec=%d)",
-                                aerr, ipi_vector);
                     break;
                 }
                 case APIC_DELMODE_FIXED:
@@ -2289,13 +2310,11 @@ static int bhyve_vcpu_run(CPUState *cpu) {
                      *
                      * Without vm_lapic_irq(), cpu_interrupt(HARD) only wakes
                      * the target but pre_run clears the flag without injecting
-                     * any vector — the IPI is lost, causing ~30s cross-CPU
+                     * any vector -- the IPI is lost, causing ~30s cross-CPU
                      * stalls (BSP times out waiting for AP acknowledgement).
                      */
                     AccelCPUState *tqcpu = target_cs->accel;
-                    int ipi_err = vm_lapic_irq(tqcpu->vcpu, ipi_vector);
-                    if (ipi_log < 20)
-                        fprintf(stderr, "(FIXED:vec=%d,err=%d)", ipi_vector, ipi_err);
+                    vm_lapic_irq(tqcpu->vcpu, ipi_vector);
                     cpu_interrupt(target_cs, CPU_INTERRUPT_HARD);
                     break;
                 }
@@ -2303,18 +2322,10 @@ static int bhyve_vcpu_run(CPUState *cpu) {
                     cpu_interrupt(target_cs, CPU_INTERRUPT_NMI);
                     break;
                 default:
-                    if (ipi_log < 20)
-                        fprintf(stderr, "(unhandled mode 0x%x)", ipi_mode);
                     break;
                 }
             }
             bql_unlock();
-
-            if (ipi_log < 20) {
-                fprintf(stderr, "\n");
-                fflush(stderr);
-                ipi_log++;
-            }
             break;
         }
         default:
@@ -2377,36 +2388,24 @@ int bhyve_init_vcpu(CPUState *cpu)
 
     // Create vCPU
     qcpu->vcpu = vm_vcpu_open(mach->vm, cpu->cpu_index); // cpu_index 0 is BSP
-    fprintf(stderr, "vcpu_open: cpu_index=%d vcpu=%p\n", cpu->cpu_index, (void*)qcpu->vcpu);
 
     err = vm_get_capability(qcpu->vcpu, VM_CAP_HALT_EXIT, &tmp);
     if (err < 0) {
 		fprintf(stderr, "Could not get capability halt exit (%d)\n", err);
     }
     err = vm_set_capability(qcpu->vcpu, VM_CAP_HALT_EXIT, 1);
-    fprintf(stderr, "set HALT_EXIT: %d\n", err);
-
     err = vm_set_capability(qcpu->vcpu, VM_CAP_PAUSE_EXIT, 0);
-    fprintf(stderr, "set PAUSE_EXIT(disabled): %d\n", err);
-
     err = vm_set_x2apic_state(qcpu->vcpu, X2APIC_DISABLED);
-    fprintf(stderr, "set x2apic: %d\n", err);
-
 	err = vm_set_capability(qcpu->vcpu, VM_CAP_ENABLE_INVPCID, 1);
-    fprintf(stderr, "set INVPCID: %d\n", err);
-
 	err = vm_set_capability(qcpu->vcpu, VM_CAP_IPI_EXIT, 1);
-    fprintf(stderr, "set IPI_EXIT: %d\n", err);
 
     // Start vCPU
     if (cpu->cpu_index == 0) { // BSP
         // Can run in real mode
         err = vm_set_capability(qcpu->vcpu,
             VM_CAP_UNRESTRICTED_GUEST, 1);
-        fprintf(stderr, "set UNRESTRICTED_GUEST: %d\n", err);
 
         err = vcpu_reset(qcpu->vcpu);
-        fprintf(stderr, "vcpu_reset: %d\n", err);
         assert(err == 0);
 
         /*
@@ -2425,14 +2424,13 @@ int bhyve_init_vcpu(CPUState *cpu)
 
             lapic_err = vm_lapic_get_state(qcpu->vcpu, &lapic_state);
             if (lapic_err == 0) {
-                uint32_t old_svr = lapic_state.fields[0xf].data;
                 lapic_state.fields[0xf].data &= ~0x100; /* clear APIC_SVR_ENABLE */
                 lapic_err = vm_lapic_set_state(qcpu->vcpu, &lapic_state);
-                fprintf(stderr, "SVR disable: old=0x%x new=0x%x set_err=%d\n",
-                        old_svr, lapic_state.fields[0xf].data, lapic_err);
+                if (lapic_err != 0) {
+                    fprintf(stderr, "bhyve: SVR disable failed: %d\n", lapic_err);
+                }
             } else {
-                fprintf(stderr, "SVR disable: get_state failed err=%d\n",
-                        lapic_err);
+                fprintf(stderr, "bhyve: SVR get_state failed: %d\n", lapic_err);
             }
         }
     } else {
@@ -2450,8 +2448,6 @@ int bhyve_init_vcpu(CPUState *cpu)
             VM_CAP_UNRESTRICTED_GUEST, 1);
         cpu->halted = true;
         cpu->stopped = true;
-        fprintf(stderr, "AP cpu_index=%d: halted, will activate on SIPI\n",
-                cpu->cpu_index);
     }
 
     {
@@ -2463,22 +2459,29 @@ int bhyve_init_vcpu(CPUState *cpu)
          * Suspend sets debug_cpus so vm_resume_cpu works on first vm_run.
          */
         err = vm_activate_cpu(qcpu->vcpu);
-        fprintf(stderr, "vm_activate_cpu[%d]: %d\n", cpu->cpu_index, err);
         err = vm_suspend_cpu(qcpu->vcpu);
-        fprintf(stderr, "vm_suspend_cpu[%d]: %d\n", cpu->cpu_index, err);
     }
 
     // Sync registers on exec
     qcpu->dirty = true;
     cpu->accel = qcpu;
 
+    /*
+     * Set hardware breakpoint on intr_init_final's STI instruction
+     * (FreeBSD 15.0 kernel address 0xffffffff810411f4) so we get a
+     * VM_EXITCODE_DEBUG exit right before the guest enables interrupts.
+     * This lets us inspect and scrub the vLAPIC IRR to prevent trap 30.
+     * Only set on BSP (cpu_index 0).
+     */
+    /* DR0 breakpoint disabled — guest clears DR7 during early init,
+     * and the debug exception fires at wrong UEFI addresses causing
+     * an infinite DEBUG exit loop. The targeted IRR scrub in pre_run
+     * handles trap 30 prevention instead. */
 
     return 0; // Return success
 }
 
 void bhyve_destroy_vcpu(CPUState *cpu) {
-    struct bhyve_machine* mach = get_bhyve_mach();
-
     AccelCPUState *qcpu = cpu->accel;
 
     if (qcpu->lapic_poll_timer) {
@@ -2492,15 +2495,6 @@ void bhyve_destroy_vcpu(CPUState *cpu) {
 int bhyve_vcpu_exec(CPUState *cpu)
 {
     int ret;
-    static int resume_debug = 2;  /* per-CPU debug */
-    static int exec_enter_log = 0;
-
-    if (exec_enter_log < 4) {
-        fprintf(stderr, "bhyve_vcpu_exec[%d]: enter exception_index=%d halted=%d stopped=%d\n",
-                cpu->cpu_index, cpu->exception_index, cpu->halted, cpu->stopped);
-        fflush(stderr);
-        exec_enter_log++;
-    }
 
     while (1) {
         if (cpu->exception_index >= EXCP_INTERRUPT) {
@@ -2509,13 +2503,7 @@ int bhyve_vcpu_exec(CPUState *cpu)
             break;
         }
 
-        ret = vm_resume_cpu(cpu->accel->vcpu);
-        if (resume_debug > 0) {
-            fprintf(stderr, "vm_resume_cpu[%d]: %d (errno=%d)\n",
-                    cpu->cpu_index, ret, errno);
-            fflush(stderr);
-            resume_debug--;
-        }
+        vm_resume_cpu(cpu->accel->vcpu);
         ret = bhyve_vcpu_run(cpu);
         if (ret != 0) {
             break;
@@ -2597,7 +2585,7 @@ static void bhyve_update_mapping(hwaddr start_pa, ram_addr_t size,
 {
     struct bhyve_machine *mach = get_bhyve_mach();
     struct bhyve_seg_and_off segoff;
-    int prot, ret;
+    int prot;
     segoff = calc_segoff_from_vmap(mach->host_vmap, host_va);
 
     if (add) {
@@ -2605,9 +2593,14 @@ static void bhyve_update_mapping(hwaddr start_pa, ram_addr_t size,
         if (!rom) {
             prot |= PROT_WRITE;
         }
-        ret = vm_mmap_memseg(mach->vm, start_pa, segoff.seg.segid, segoff.offset, size, prot);
+        fprintf(stderr, "EPT_MAP: GPA=0x%lx size=0x%lx prot=%d rom=%d name=%s segid=%d segoff=0x%lx\n",
+                (unsigned long)start_pa, (unsigned long)size, prot, rom,
+                name ? name : "(null)", segoff.seg.segid, (unsigned long)segoff.offset);
+        vm_mmap_memseg(mach->vm, start_pa, segoff.seg.segid, segoff.offset, size, prot);
     } else {
-        ret = vm_munmap_memseg(mach->vm, start_pa, size);
+        fprintf(stderr, "EPT_UNMAP: GPA=0x%lx size=0x%lx name=%s\n",
+                (unsigned long)start_pa, (unsigned long)size, name ? name : "(null)");
+        vm_munmap_memseg(mach->vm, start_pa, size);
     }
 }
 
@@ -2774,12 +2767,7 @@ void *bhyve_ram_alloc(size_t mr_size, uint64_t *alignment, int flags, const char
     if (strcmp(name, "pc.ram") == 0) {
         ram_memseg.seg_start = bhyve_allocate_pc_memory(mr_size, ram_memseg.name, mach->segid_num++);
     } else {
-        fprintf(stderr, "  vm_create_devmem(segid=%d, name='%s', size=%zu)\n",
-                mach->segid_num, ram_memseg.name, mr_size);
         ram_memseg.seg_start = vm_create_devmem(mach->vm, mach->segid_num++, ram_memseg.name, mr_size);
-        if (!ram_memseg.seg_start || ram_memseg.seg_start == (void*)SIZE_MAX) {
-            fprintf(stderr, "  vm_create_devmem FAILED: errno=%d (%s)\n", errno, strerror(errno));
-        }
     }
     if (!ram_memseg.seg_start || ram_memseg.seg_start == (void*)SIZE_MAX) {
         fprintf(stderr, "Could not allocate device memory for %s\n", name);
@@ -2899,21 +2887,14 @@ static bool stdin_nonblock_set = false;
 
 static void mainloop_diag_cb(void *opaque)
 {
-    static long tick = 0;
-    tick++;
-
-    /* Lazy lookup of the chardev — try common names */
+    /* Lazy lookup of the chardev -- try common names */
     if (!stdin_chardev) {
         stdin_chardev = qemu_chr_find("con0");      /* virtio-console */
         if (!stdin_chardev)
             stdin_chardev = qemu_chr_find("serial0"); /* -serial stdio */
         if (!stdin_chardev)
             stdin_chardev = qemu_chr_find("compat_monitor0");
-        if (stdin_chardev && tick <= 3) {
-            fprintf(stderr, "STDIN_POLL: found chardev '%s'\n",
-                    stdin_chardev->label ? stdin_chardev->label : "?");
-            fflush(stderr);
-        }
+        /* found it */
     }
 
     /* Set stdin to non-blocking (once) */
@@ -2931,14 +2912,6 @@ static void mainloop_diag_cb(void *opaque)
         int n = read(STDIN_FILENO, buf, sizeof(buf));
         if (n > 0) {
             qemu_chr_be_write(stdin_chardev, buf, n);
-            static long chars_injected = 0;
-            chars_injected += n;
-            if (chars_injected <= 20) {
-                fprintf(stderr, "STDIN_POLL: injected %d bytes (total=%ld) first=0x%02x '%c'\n",
-                        n, chars_injected, buf[0],
-                        (buf[0] >= 0x20 && buf[0] < 0x7f) ? buf[0] : '.');
-                fflush(stderr);
-            }
         }
     }
 
@@ -2969,6 +2942,29 @@ bhyve_accel_init(AccelState *as, MachineState *ms)
 
     /* Setup Memory */
     bhyve_memory_init();
+
+    /*
+     * Enable CPU ticks so QEMU_CLOCK_VIRTUAL advances with real time.
+     * Without this, the ACPI PM Timer (port 0x408) returns a constant
+     * value and UEFI firmware spins forever in delay loops.
+     */
+    cpu_enable_ticks();
+
+    /*
+     * Mask all 8259A PIC IRQs so no PIC interrupts fire before the guest
+     * has set up its IDT handlers.  UEFI firmware may reprogram the PIC
+     * base vector (e.g. to 0x40) and leave IRQ0 (PIT timer) unmasked.
+     * If the PIT fires before the guest installs real handlers, the
+     * default Xrsvd IDT stub pushes T_RESERVED (30) → kernel panic.
+     *
+     * The guest OS will unmask specific IRQs as it initializes drivers.
+     * PIC1 (master) mask register = port 0x21, PIC2 (slave) = port 0xA1.
+     * Writing 0xFF masks all 8 IRQs on each chip.
+     */
+    cpu_outb(0x21, 0xFF);  /* Mask all master PIC IRQs */
+    cpu_outb(0xA1, 0xFF);  /* Mask all slave PIC IRQs */
+    printf("8259A PIC: all IRQs masked (master=0xFF, slave=0xFF)\n");
+
     return 0;
 }
 
