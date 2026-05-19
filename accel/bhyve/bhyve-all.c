@@ -1815,6 +1815,19 @@ static int bhyve_vcpu_run(CPUState *cpu) {
              */
             bql_lock();
             rc = vm_assist_qio(qcpu->vcpu, vmm_io_callback, &vme);
+            /*
+             * Run timers periodically during I/O exits so the stdin
+             * polling workaround fires while the guest is waiting for
+             * keyboard input (e.g. FreeBSD loader menu, login prompt).
+             */
+            if ((exit_inout % 50) == 0) {
+                qemu_clock_run_timers(QEMU_CLOCK_VIRTUAL);
+                {
+                    AioContext *ctx = qemu_get_aio_context();
+                    timerlistgroup_run_timers(&ctx->tlg);
+                    aio_poll(ctx, false);
+                }
+            }
             bql_unlock();
             break;
         case VM_EXITCODE_INST_EMUL:
