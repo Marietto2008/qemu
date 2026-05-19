@@ -45,8 +45,6 @@ static void bhyve_pic_reset(DeviceState *dev)
 volatile long pic_irq0_assert = 0;
 volatile long pic_irq0_deassert = 0;
 volatile long pic_other_irq = 0;
-volatile long pic_irq4_assert = 0;
-volatile long pic_irq4_deassert = 0;
 
 /*
  * Bitmask of pending ISA IRQs for userspace injection.
@@ -65,30 +63,6 @@ static void bhyve_pic_set_irq(void *opaque, int irq, int level)
         else pic_irq0_deassert++;
     } else {
         pic_other_irq++;
-    }
-
-    /* Always log IRQ4 (serial) — no limit */
-    if (irq == 4) {
-        if (level) pic_irq4_assert++;
-        else pic_irq4_deassert++;
-        fprintf(stderr, "SERIAL_IRQ4: %s #%ld (total assert=%ld deassert=%ld)\n",
-                level ? "ASSERT" : "deassert",
-                level ? pic_irq4_assert : pic_irq4_deassert,
-                pic_irq4_assert, pic_irq4_deassert);
-        fflush(stderr);
-    }
-
-    /* Log first few IRQ0 assertions to confirm PIT is firing */
-    if (irq == 0 && level && pic_irq0_assert <= 5) {
-        fprintf(stderr, "PIC: IRQ0 assert #%ld (PIT timer fired!)\n",
-                pic_irq0_assert);
-        fflush(stderr);
-    }
-    /* Log non-IRQ0 interrupts (first few) */
-    if (irq != 0 && pic_other_irq <= 10) {
-        fprintf(stderr, "PIC: IRQ%d %s (#%ld)\n", irq,
-                level ? "assert" : "deassert", pic_other_irq);
-        fflush(stderr);
     }
 
     if (level) {
@@ -126,7 +100,6 @@ static void bhyve_pic_set_irq(void *opaque, int irq, int level)
     if (err) {
         fprintf(stderr, "bhyve: 8259 failed, irq (%d) err=%d errno=%d (%s)\n",
                 irq, err, errno, strerror(errno));
-        fflush(stderr);
     }
 }
 

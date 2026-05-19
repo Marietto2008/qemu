@@ -28,8 +28,6 @@ static void bhyve_ioapic_reset(DeviceState *dev)
     bhyve_ioapic_put(s);
 }
 
-static volatile long ioapic_irq_count = 0;
-
 /*
  * Bitmask of pending IOAPIC IRQs for userspace injection.
  * Set by bhyve_ioapic_set_irq when level=1, cleared by pre_run
@@ -72,16 +70,6 @@ static void bhyve_ioapic_set_irq(void *opaque, int irq, int level)
         __atomic_or_fetch(&bhyve_ioapic_pending_irqs, (1u << pin), __ATOMIC_RELEASE);
     } else {
         err = vm_ioapic_deassert_irq(bhyve_mach.vm, pin);
-    }
-
-    /* Log first few IOAPIC IRQ assertions */
-    if (level && ioapic_irq_count < 20) {
-        fprintf(stderr, "IOAPIC: IRQ%d→pin%d %s (#%ld) err=%d\n",
-                irq, pin, level ? "assert" : "deassert",
-                ++ioapic_irq_count, err);
-        fflush(stderr);
-    } else if (level) {
-        ioapic_irq_count++;
     }
 
     /*
@@ -206,13 +194,6 @@ bhyve_ioapic_mem_write(void *opaque, hwaddr addr, uint64_t val,
                 uint8_t vec = s->ioredtbl[index] & 0xFF;
                 if (vec >= 0x10) {
                     bhyve_ioapic_vectors[index] = vec;
-                    static int rte_log = 0;
-                    if (rte_log < 20) {
-                        int masked = (s->ioredtbl[index] >> IOAPIC_LVT_MASKED_SHIFT) & 1;
-                        fprintf(stderr, "IOAPIC: RTE[%d] vec=0x%02x masked=%d\n",
-                                index, vec, masked);
-                        rte_log++;
-                    }
                 }
             }
         }
