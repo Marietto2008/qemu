@@ -14,6 +14,7 @@
 #include "qemu/error-report.h"
 #include "qapi/error.h"
 #include "system/memory.h"
+#include "system/cpu-timers.h"
 #include "strings.h"
 #include "qapi/qapi-types-common.h"
 #include "qapi/qapi-visit-common.h"
@@ -677,8 +678,24 @@ vmm_io_callback(struct vm_qio *io)
     int ret;
 
     io_total++;
+    /*
+     * ACPI PM Timer (port 0x408): if address_space_rw returns 0xffffffff
+     * it means the PIIX4 PM I/O region isn't mapped yet. Provide the
+     * correct PM Timer value directly from the virtual clock.
+     * PM Timer ticks at 3.579545 MHz, 24-bit counter.
+     */
     ret = address_space_rw(&address_space_io, io->port, attrs, io->data,
         io->size, !io->in);
+    if (io->port == 0x408 && io->in && io->size == 4) {
+        uint32_t val = *(uint32_t *)io->data;
+        if (val == 0xffffffff) {
+            /* Region not mapped — compute PM timer value directly */
+            int64_t ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+            uint32_t ticks = (uint32_t)muldiv64(ns, 3579545, 1000000000LL);
+            ticks &= 0xffffff; /* 24-bit counter */
+            *(uint32_t *)io->data = ticks;
+        }
+    }
     if (ret != MEMTX_OK) {
         error_report("Bhyve: I/O Transaction Failed "
             "[%s, port=%u, size=%zu]", (io->in ? "in" : "out"),
@@ -1262,6 +1279,43 @@ static int bhyve_vcpu_run(CPUState *cpu) {
 
 		error = vm_run(qcpu->vcpu, &vmrun);
 		vm_run_total++;
+
+        /* Ring buffer: last 32 exits before crash for post-mortem */
+        {
+            static struct { int exitcode; uint64_t rip; uint32_t port; long count; } last_exits[32];
+            static int exit_idx = 0;
+            last_exits[exit_idx & 31].exitcode = vme.exitcode;
+            last_exits[exit_idx & 31].rip = vme.rip;
+            last_exits[exit_idx & 31].port = (vme.exitcode == VM_EXITCODE_INOUT) ? vme.u.inout.port : 0;
+            last_exits[exit_idx & 31].count = vm_run_total;
+            exit_idx++;
+
+            /* Dump ring buffer on VMX error (triple fault) or unknown exit */
+            if (vme.exitcode == VM_EXITCODE_VMX ||
+                (vme.exitcode != VM_EXITCODE_INOUT &&
+                 vme.exitcode != VM_EXITCODE_BOGUS &&
+                 vme.exitcode != VM_EXITCODE_HLT &&
+                 vme.exitcode != VM_EXITCODE_RDMSR &&
+                 vme.exitcode != VM_EXITCODE_WRMSR &&
+                 vme.exitcode != VM_EXITCODE_INST_EMUL &&
+                 vme.exitcode != VM_EXITCODE_PAUSE &&
+                 vme.exitcode != VM_EXITCODE_REQIDLE &&
+                 vme.exitcode != VM_EXITCODE_INOUT_STR &&
+                 vme.exitcode != VM_EXITCODE_IPI &&
+                 vme.exitcode != VM_EXITCODE_SPINUP_AP &&
+                 vme.exitcode != VM_EXITCODE_IOAPIC_EOI &&
+                 vme.exitcode != VM_EXITCODE_SUSPENDED)) {
+                fprintf(stderr, "\n=== UNEXPECTED EXIT %d at rip=0x%lx (run #%ld) ===\n",
+                        vme.exitcode, (unsigned long)vme.rip, vm_run_total);
+                fprintf(stderr, "Last 32 exits:\n");
+                for (int i = 0; i < 32; i++) {
+                    int j = (exit_idx - 32 + i) & 31;
+                    fprintf(stderr, "  [%ld] exit=%d rip=0x%lx port=0x%x\n",
+                            last_exits[j].count, last_exits[j].exitcode,
+                            (unsigned long)last_exits[j].rip, last_exits[j].port);
+                }
+            }
+        }
 
         if (error != 0) {
             static int vm_run_err_log = 0;
@@ -2391,6 +2445,14 @@ bhyve_accel_init(AccelState *as, MachineState *ms)
 
     /* Setup Memory */
     bhyve_memory_init();
+
+    /*
+     * Enable CPU ticks so QEMU_CLOCK_VIRTUAL advances with real time.
+     * Without this, the ACPI PM Timer (port 0x408) returns a constant
+     * value and UEFI firmware spins forever in delay loops.
+     */
+    cpu_enable_ticks();
+
     return 0;
 }
 
