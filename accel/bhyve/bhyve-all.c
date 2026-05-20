@@ -26,6 +26,7 @@
 #include <signal.h>
 #include <unistd.h>
 #include <errno.h>
+#include <sys/sched.h>
 
 #include <machine/specialreg.h>
 
@@ -118,6 +119,15 @@ static void scrub_lapic_bad_vectors(struct vcpu *vcpu)
     }
 
     if (modified) {
+        /*
+         * Preserve APIC ID (fields[2], offset 0x020). vcpu_ioctl clobbers
+         * fields[0] with the vcpuid; verify fields[2] wasn't also affected.
+         * Re-read and restore APIC ID to prevent corruption.
+         */
+        struct vm_lapic_state verify;
+        memset(&verify, 0, sizeof(verify));
+        vcpu_ioctl(vcpu, VM_LAPIC_GET_STATE, &verify);
+        state.fields[2].data = verify.fields[2].data;
         vcpu_ioctl(vcpu, VM_LAPIC_SET_STATE, &state);
     }
 }
@@ -161,6 +171,14 @@ static void lapic_poll_timer_cb(void *opaque)
     CPUState *cpu = (CPUState *)opaque;
     if (cpu) {
         if (cpu->halted) {
+            /*
+             * Force-unhalt the CPU. The bhyve kernel's vLAPIC manages
+             * real interrupt state — QEMU just needs to re-enter vm_run
+             * so the kernel can inject pending interrupts.
+             * cpu_interrupt + halted=false ensures the thread loop
+             * calls bhyve_vcpu_exec instead of going back to sleep.
+             */
+            cpu->halted = false;
             cpu_interrupt(cpu, CPU_INTERRUPT_HARD);
         } else {
             /* Non-halted CPU: force vm_run exit so kernel can
@@ -233,9 +251,189 @@ struct AccelCPUState {
 
     /* Per-vCPU LAPIC poll timer for waking halted vCPUs */
     QEMUTimer *lapic_poll_timer;
+
+    /* Per-vCPU SMP state — these were previously function-scoped statics
+     * shared across all vCPUs, causing race conditions with SMP. */
+    int hwintr_state;       /* 0=off, 1=masked, 2=grace, 3=done */
+    bool fsgsbase_forced;   /* CR4.FSGSBASE force-set done for this vCPU */
 };
 
 /* -------------------------------------------------------------------------- */
+
+/*
+ * MADT Patching for SMP
+ *
+ * The BHYVE_UEFI firmware generates its own ACPI tables including a MADT
+ * with only 1 CPU entry (APIC ID 0). It doesn't read QEMU's fw_cfg ACPI
+ * tables like OVMF does. To support SMP, we directly scan guest memory
+ * for the MADT ("APIC" signature) and add missing CPU entries.
+ *
+ * The firmware places ACPI tables in the high memory region (typically
+ * around 0xBFBF0000-0xC0000000 for a 3-4GB guest). We scan this region
+ * for the MADT signature when the kernel first enters long mode.
+ */
+static bool madt_patched = false;
+static int madt_patch_attempts = 0;
+
+static uint8_t acpi_checksum(const uint8_t *data, int len)
+{
+    uint8_t sum = 0;
+    for (int i = 0; i < len; i++)
+        sum += data[i];
+    return sum;
+}
+
+static void patch_madt_for_smp(struct vmctx *vm, int num_cpus)
+{
+    /*
+     * BHYVE_UEFI places ACPI tables in the firmware area around 0xBFBF0000
+     * (inside the PCI hole, above lowmem). This area cannot be accessed via
+     * vm_get_guestmem_from_ctx() or vm_map_gpa(). Use QEMU's
+     * cpu_physical_memory_read/write which goes through the QEMU memory
+     * subsystem and can access any mapped GPA including firmware regions.
+     *
+     * Scan 0xBFBF0000-0xBFC00000 for the MADT (signature "APIC").
+     */
+    uint64_t madt_gpa = 0;
+    uint8_t buf[4096];  /* read buffer for scanning */
+
+    /* Scan the BHYVE firmware ACPI area in 4K pages */
+    uint64_t scan_start = 0xBFBF0000ULL;
+    uint64_t scan_end   = 0xBFC00000ULL;
+
+    fprintf(stderr, "*** MADT-PATCH: scanning GPA 0x%lx-0x%lx via cpu_physical_memory_read...\n",
+            (unsigned long)scan_start, (unsigned long)scan_end);
+
+    for (uint64_t page = scan_start; page < scan_end; page += 0x1000) {
+        cpu_physical_memory_read(page, buf, 0x1000);
+
+        for (int off = 0; off + 44 <= 0x1000; off += 16) {
+            if (buf[off] != 'A' || buf[off+1] != 'P' ||
+                buf[off+2] != 'I' || buf[off+3] != 'C')
+                continue;
+
+            uint32_t tbl_len = *(uint32_t *)(buf + off + 4);
+            if (tbl_len < 44 || tbl_len > 4096)
+                continue;
+
+            if (memcmp(buf + off + 10, "BHYVE", 5) != 0)
+                continue;
+
+            /* Re-read the full table if it spans beyond current page */
+            uint8_t full_tbl[4096];
+            uint64_t tbl_gpa = page + off;
+            cpu_physical_memory_read(tbl_gpa, full_tbl, tbl_len);
+
+            uint8_t csum = acpi_checksum(full_tbl, tbl_len);
+            fprintf(stderr, "*** MADT-PATCH: found BHYVE MADT at GPA 0x%lx len=%u "
+                    "OEM=%.6s tbl=%.8s csum=%u\n",
+                    (unsigned long)tbl_gpa, tbl_len,
+                    full_tbl + 10, full_tbl + 16, csum);
+
+            if (csum == 0 && tbl_len >= 62) {
+                madt_gpa = tbl_gpa;
+                break;
+            }
+            fprintf(stderr, "*** MADT-PATCH: bad checksum (%u) or short, skipping\n", csum);
+        }
+        if (madt_gpa) break;
+    }
+
+    if (!madt_gpa) {
+        fprintf(stderr, "*** MADT-PATCH: MADT not found in firmware area\n");
+        return;
+    }
+
+    /* Read the full MADT */
+    uint8_t madt_buf[4096];
+    uint32_t madt_len;
+    cpu_physical_memory_read(madt_gpa, madt_buf, 44);
+    madt_len = *(uint32_t *)(madt_buf + 4);
+    cpu_physical_memory_read(madt_gpa, madt_buf, madt_len);
+
+    /* Count existing LAPIC entries (type 0, length 8) */
+    int existing_cpus = 0;
+    int offset = 44; /* skip ACPI header (36) + local APIC addr (4) + flags (4) */
+    while (offset + 2 <= (int)madt_len) {
+        uint8_t type = madt_buf[offset];
+        uint8_t len = madt_buf[offset + 1];
+        if (len == 0) break;
+        if (type == 0 && len == 8)
+            existing_cpus++;
+        offset += len;
+    }
+
+    fprintf(stderr, "*** MADT-PATCH: found %d CPU entries, need %d\n",
+            existing_cpus, num_cpus);
+
+    if (existing_cpus >= num_cpus) {
+        fprintf(stderr, "*** MADT-PATCH: already has enough CPUs\n");
+        madt_patched = true;
+        return;
+    }
+
+    /* Build patched MADT in a temp buffer */
+    uint8_t new_madt[2048];
+    int new_offset = 0;
+
+    /* Copy header (44 bytes) */
+    memcpy(new_madt, madt_buf, 44);
+    new_offset = 44;
+
+    /* Walk existing entries, insert new LAPIC entries after last LAPIC */
+    offset = 44;
+    bool added_new = false;
+    while (offset + 2 <= (int)madt_len) {
+        uint8_t type = madt_buf[offset];
+        uint8_t len = madt_buf[offset + 1];
+        if (len == 0) break;
+
+        /* Copy this entry */
+        if (new_offset + len <= 2048) {
+            memcpy(new_madt + new_offset, madt_buf + offset, len);
+            new_offset += len;
+        }
+
+        /* After last LAPIC entry, insert new CPU entries */
+        if (type == 0 && !added_new) {
+            int next_off = offset + len;
+            uint8_t next_type = (next_off + 2 <= (int)madt_len) ?
+                                madt_buf[next_off] : 0xFF;
+            if (next_type != 0) {
+                for (int cpu_id = existing_cpus; cpu_id < num_cpus; cpu_id++) {
+                    if (new_offset + 8 > 2048) break;
+                    new_madt[new_offset + 0] = 0;      /* Type: Local APIC */
+                    new_madt[new_offset + 1] = 8;      /* Length */
+                    new_madt[new_offset + 2] = cpu_id;  /* ACPI Processor ID */
+                    new_madt[new_offset + 3] = cpu_id;  /* APIC ID */
+                    new_madt[new_offset + 4] = 1;       /* Flags: enabled */
+                    new_madt[new_offset + 5] = 0;
+                    new_madt[new_offset + 6] = 0;
+                    new_madt[new_offset + 7] = 0;
+                    new_offset += 8;
+                    fprintf(stderr, "*** MADT-PATCH: added CPU APIC_ID=%d\n",
+                            cpu_id);
+                }
+                added_new = true;
+            }
+        }
+        offset += len;
+    }
+
+    /* Update length and checksum */
+    *(uint32_t *)(new_madt + 4) = new_offset;
+    new_madt[9] = 0;
+    new_madt[9] = (uint8_t)(0 - acpi_checksum(new_madt, new_offset));
+
+    /* Write patched MADT back to guest memory via QEMU memory subsystem */
+    cpu_physical_memory_write(madt_gpa, new_madt, new_offset);
+
+    fprintf(stderr, "*** MADT-PATCH: SUCCESS — patched MADT at GPA 0x%lx, "
+            "new length=%d (%d CPUs)\n",
+            (unsigned long)madt_gpa, new_offset, num_cpus);
+
+    madt_patched = true;
+}
 
 static bool bhyve_allowed;
 
@@ -1074,18 +1272,24 @@ static void bhyve_vcpu_pre_run(CPUState *cpu) {
         /*
          * Inject pending interrupts into the vLAPIC.
          *
+         * PIC (8259) interrupts go to BSP only (cpu_index == 0).
+         * IOAPIC interrupts can target any vCPU, but the current
+         * code uses a global pending bitmask — for now inject on
+         * the vCPU that had CPU_INTERRUPT_HARD set.
+         *
          * bhyve's kernel vatpic/vioapic do NOT auto-inject into
          * the vLAPIC — vmx_inject_interrupts doesn't pick them up.
          * We must inject from userspace via vm_lapic_irq().
-         *
-         * Read the pending IRQ bitmask (set by bhyve_pic_set_irq),
-         * find the highest-priority pending IRQ (lowest number),
-         * and look up the correct vector from the kernel's IOAPIC
-         * redirection table. The IOAPIC vector is what the guest
-         * expects (e.g., 0x30 for timer, not PIC's 0x20).
          */
-        uint32_t pending = __atomic_exchange_n(
-            &bhyve_pic_pending_irqs, 0, __ATOMIC_ACQ_REL);
+        /*
+         * PIC interrupts: only BSP (cpu_index 0) consumes these.
+         * APs must not steal PIC IRQs from the pending bitmask.
+         */
+        uint32_t pending = 0;
+        if (cpu->cpu_index == 0) {
+            pending = __atomic_exchange_n(
+                &bhyve_pic_pending_irqs, 0, __ATOMIC_ACQ_REL);
+        }
         if (pending) {
             int irq = __builtin_ctz(pending);  /* lowest set bit = highest priority */
 
@@ -1182,6 +1386,29 @@ static void bhyve_vcpu_post_run(CPUState *cpu) {
     AccelCPUState *qcpu = cpu->accel;
     struct vcpu *vcpu = qcpu->vcpu;
     uint64_t val;
+
+    /*
+     * Sync RIP from VMCS back to QEMU's env->eip.
+     *
+     * The kernel advances guest RIP by inst_length for exits that go to
+     * userspace (INOUT, INST_EMUL, etc.) via vcpu->nextrip.  But QEMU's
+     * env->eip is stale — it still holds the RIP from before the exit.
+     * If vmm_set_registers() runs before the next vm_run (dirty=true),
+     * it overwrites VMCS_GUEST_RIP with the stale env->eip, causing the
+     * guest to re-execute the same instruction in an infinite loop.
+     *
+     * Fix: always read the current guest RIP from the VMCS after vm_run
+     * and update env->eip so the two stay in sync.
+     */
+    vm_get_register(vcpu, VM_REG_GUEST_RIP, &val);
+    env->eip = val;
+
+    /*
+     * Sync RAX — vm_assist_qio updates RAX in the VMCS for IN instructions
+     * (port reads), but QEMU's env->regs[R_EAX] stays stale.
+     */
+    vm_get_register(vcpu, VM_REG_GUEST_RAX, &val);
+    env->regs[R_EAX] = val;
 
     // Set Eflags
     vm_get_register(vcpu, VM_REG_GUEST_RFLAGS, &env->eflags);
@@ -1296,6 +1523,20 @@ static int bhyve_vcpu_run(CPUState *cpu) {
          (env->eflags & IF_MASK)) ||
         (cpu->interrupt_request & CPU_INTERRUPT_NMI)) {
         cpu->halted = false;
+    }
+    /*
+     * bhyve wakeup: env->eflags may be stale (not synced from guest VMCS).
+     * If the poll timer fired CPU_INTERRUPT_HARD but env->eflags lacks IF,
+     * the AP stays halted forever.  Read actual guest RFLAGS from the VMCS
+     * and retry the check.
+     */
+    if (cpu->halted && (cpu->interrupt_request & CPU_INTERRUPT_HARD)) {
+        AccelCPUState *qcpu_wake = cpu->accel;
+        uint64_t real_rflags = 0;
+        vm_get_register(qcpu_wake->vcpu, VM_REG_GUEST_RFLAGS, &real_rflags);
+        if (real_rflags & IF_MASK) {
+            cpu->halted = false;
+        }
     }
     if (cpu->interrupt_request & CPU_INTERRUPT_SIPI) {
         cpu->interrupt_request &= ~CPU_INTERRUPT_SIPI;
@@ -1425,9 +1666,6 @@ static int bhyve_vcpu_run(CPUState *cpu) {
          * - After grace period: clear MASK_HWINTR, allow interrupts
          */
         {
-            static int hwintr_state = 0;  /* 0=off, 1=masked, 2=grace, 3=done */
-            static long grace_start = 0;
-
             uint64_t pre_rip = 0, pre_rflags = 0;
             vm_get_register(qcpu->vcpu, VM_REG_GUEST_RIP, &pre_rip);
             vm_get_register(qcpu->vcpu, VM_REG_GUEST_RFLAGS, &pre_rflags);
@@ -1435,13 +1673,13 @@ static int bhyve_vcpu_run(CPUState *cpu) {
 
             int in_kernel = (pre_rip >= 0xffffffff80000000ULL);
 
-            if (hwintr_state == 0 && in_kernel && !guest_if) {
+            if (qcpu->hwintr_state == 0 && in_kernel && !guest_if) {
                 /* Guest entered kernel with IF=0 — mask interrupts */
                 vm_set_capability(qcpu->vcpu, VM_CAP_MASK_HWINTR, 1);
-                hwintr_state = 1;
-                fprintf(stderr, "*** MASK_HWINTR: enabled (kernel IF=0, RIP=0x%lx)\n",
-                        (unsigned long)pre_rip);
-            } else if (hwintr_state == 1 && guest_if && in_kernel) {
+                qcpu->hwintr_state = 1;
+                fprintf(stderr, "*** MASK_HWINTR[%d]: enabled (kernel IF=0, RIP=0x%lx)\n",
+                        cpu->cpu_index, (unsigned long)pre_rip);
+            } else if (qcpu->hwintr_state == 1 && guest_if && in_kernel) {
                 /*
                  * Guest did STI in kernel mode — scrub ALL stale IRR
                  * vectors and immediately unmask. The guest needs
@@ -1464,10 +1702,10 @@ static int bhyve_vcpu_run(CPUState *cpu) {
                     vcpu_ioctl(qcpu->vcpu, VM_LAPIC_SET_STATE, &unmask_lapic);
                 }
                 vm_set_capability(qcpu->vcpu, VM_CAP_MASK_HWINTR, 0);
-                hwintr_state = 3;
-                fprintf(stderr, "*** MASK_HWINTR: scrubbed + disabled at IF=1 "
+                qcpu->hwintr_state = 3;
+                fprintf(stderr, "*** MASK_HWINTR[%d]: scrubbed + disabled at IF=1 "
                         "(run #%ld, RIP=0x%lx)\n",
-                        vm_run_total, (unsigned long)pre_rip);
+                        cpu->cpu_index, vm_run_total, (unsigned long)pre_rip);
             }
         }
 
@@ -1544,6 +1782,49 @@ static int bhyve_vcpu_run(CPUState *cpu) {
 		error = vm_run(qcpu->vcpu, &vmrun);
 		vm_run_total++;
 
+<<<<<<< Updated upstream
+=======
+        /* Ensure CR4.FSGSBASE (bit 16) is set once the guest kernel is running.
+         *
+         * The guest kernel's identify_cpu reads CPUID leaf 7 and sees FSGSBASE,
+         * but for unknown reasons does not set CR4.FSGSBASE during initcpu.
+         * Without it, wrfsbase causes #UD → SIGILL in every forked child
+         * process (sshd, pkg-static, etc.).
+         *
+         * Force-set the bit once the guest enters kernel long mode.
+         * CR4.FSGSBASE is not in the VMX CR4 mask, so it's freely writable.
+         */
+        {
+            uint64_t cr4_now = 0;
+            vm_get_register(qcpu->vcpu, VM_REG_GUEST_CR4, &cr4_now);
+
+            if (!qcpu->fsgsbase_forced && !(cr4_now & (1ULL << 16)) &&
+                vme.rip >= 0xffffffff80000000ULL) {
+                cr4_now |= (1ULL << 16);  /* CR4.FSGSBASE */
+                vm_set_register(qcpu->vcpu, VM_REG_GUEST_CR4, cr4_now);
+                qcpu->fsgsbase_forced = true;
+                fprintf(stderr, "*** CR4.FSGSBASE[%d]: forced ON (CR4=0x%lx, run #%ld)\n",
+                        cpu->cpu_index, (unsigned long)cr4_now, vm_run_total);
+            }
+
+            /* Patch MADT for SMP: add missing CPU entries.
+             * The BHYVE_UEFI firmware generates a MADT with only 1 CPU.
+             * We MUST wait until the kernel enters long mode to patch,
+             * because UEFI may regenerate/relocate ACPI tables until
+             * ExitBootServices(). The kernel reads MADT early in boot
+             * but after UEFI has finalized the tables. */
+            if (!madt_patched && cpu->cpu_index == 0) {
+                bool should_try = (vme.rip >= 0xffffffff80000000ULL);
+                if (should_try) {
+                    int total_cpus = current_machine->smp.cpus;
+                    if (total_cpus > 1) {
+                        patch_madt_for_smp(bhyve_mach.vm, total_cpus);
+                    }
+                }
+            }
+        }
+
+>>>>>>> Stashed changes
         /* Ring buffer: last 4096 exits before crash for post-mortem */
         {
             #define EXIT_RING_SIZE 4096
@@ -1620,6 +1901,53 @@ static int bhyve_vcpu_run(CPUState *cpu) {
         case VM_EXITCODE_HLT:
             exit_hlt++;
             {
+                /*
+                 * MASK_HWINTR fix for AP vCPUs:
+                 *
+                 * The pre-run MASK_HWINTR state machine masks interrupts when
+                 * a vCPU enters kernel with IF=0 (state=1), and unmasks when
+                 * IF transitions to 1 (state=3). But if the AP does STI+HLT,
+                 * the HLT exit handler sets cpu->halted and exits the loop
+                 * BEFORE the pre-run code gets a chance to detect IF=1.
+                 * With MASK_HWINTR still enabled, vmm.ko won't deliver any
+                 * interrupt to wake the AP → permanent deadlock.
+                 *
+                 * Fix: check and clear MASK_HWINTR here, before halting.
+                 */
+                if (qcpu->hwintr_state == 1) {
+                    /*
+                     * AP is halting with MASK_HWINTR still active.
+                     * An AP doing HLT MUST be able to receive interrupts
+                     * (timer, IPI) to wake up — unconditionally unmask.
+                     * Scrub stale IRR first to prevent trap 30 on wakeup.
+                     */
+                    struct vm_lapic_state unmask_lapic;
+                    memset(&unmask_lapic, 0, sizeof(unmask_lapic));
+                    if (vcpu_ioctl(qcpu->vcpu, VM_LAPIC_GET_STATE,
+                                   &unmask_lapic) == 0) {
+                        uint32_t saved_apic_id = unmask_lapic.fields[2].data;
+                        for (int i = 0; i < 8; i++) {
+                            if (unmask_lapic.fields[0x20 + i].data != 0) {
+                                fprintf(stderr,
+                                    "*** MASK_HWINTR[%d]: HLT scrub IRR[%d]"
+                                    "=0x%08x\n",
+                                    cpu->cpu_index, i,
+                                    unmask_lapic.fields[0x20 + i].data);
+                                unmask_lapic.fields[0x20 + i].data = 0;
+                            }
+                        }
+                        unmask_lapic.fields[2].data = saved_apic_id;
+                        vcpu_ioctl(qcpu->vcpu, VM_LAPIC_SET_STATE,
+                                   &unmask_lapic);
+                    }
+                    vm_set_capability(qcpu->vcpu, VM_CAP_MASK_HWINTR, 0);
+                    qcpu->hwintr_state = 3;
+                    fprintf(stderr,
+                        "*** MASK_HWINTR[%d]: scrubbed + disabled at HLT "
+                        "(run #%ld)\n",
+                        cpu->cpu_index, vm_run_total);
+                }
+
                 /*
                  * Precise LAPIC timer wakeup for HLT exits.
                  *
@@ -1808,6 +2136,40 @@ static int bhyve_vcpu_run(CPUState *cpu) {
         case VM_EXITCODE_INOUT:
         case VM_EXITCODE_INOUT_STR:
             exit_inout++;
+
+            /* Safety valve: detect infinite INOUT loops.
+             * Port 0x408 (PM timer) legitimately loops — only warn once.
+             * For other ports, if same RIP >10000 times → abort. */
+            {
+                static uint64_t last_inout_rip = 0;
+                static int inout_repeat_count = 0;
+                static bool pm_timer_warned = false;
+                if (vme.rip == last_inout_rip) {
+                    inout_repeat_count++;
+                    if (vme.u.inout.port == 0x408) {
+                        /* PM timer busy-wait is normal firmware behavior */
+                        if (!pm_timer_warned && inout_repeat_count > 1000) {
+                            fprintf(stderr,
+                                "*** NOTE: PM timer loop at RIP=0x%lx "
+                                "(normal firmware delay, suppressing)\n",
+                                (unsigned long)vme.rip);
+                            pm_timer_warned = true;
+                        }
+                    } else if (inout_repeat_count > 10000) {
+                        fprintf(stderr,
+                            "\n*** FATAL: INOUT loop at RIP=0x%lx "
+                            "port=0x%x (%d times, run #%ld) — aborting\n",
+                            (unsigned long)vme.rip,
+                            vme.u.inout.port, inout_repeat_count,
+                            vm_run_total);
+                        goto abort_vcpu_loop;
+                    }
+                } else {
+                    last_inout_rip = vme.rip;
+                    inout_repeat_count = 1;
+                }
+            }
+
             /*
              * Acquire BQL for I/O emulation — device models (serial, PIC,
              * etc.) expect it when modifying state and raising interrupts.
@@ -1816,12 +2178,18 @@ static int bhyve_vcpu_run(CPUState *cpu) {
             bql_lock();
             rc = vm_assist_qio(qcpu->vcpu, vmm_io_callback, &vme);
             /*
-             * Run timers periodically during I/O exits so the stdin
-             * polling workaround fires while the guest is waiting for
-             * keyboard input (e.g. FreeBSD loader menu, login prompt).
+             * Run timers and process main-loop I/O periodically.
+             * This is critical for SLIRP networking: DHCP responses
+             * are queued by SLIRP and need aio_poll to be delivered
+             * back to the e1000 device model.
+             *
+             * Every 10 exits: run timers + poll AIO (non-blocking).
+             * Every 200 exits: yield CPU so the main thread can run
+             * the full main loop (SLIRP fd polling, GMainContext, etc).
              */
-            if ((exit_inout % 50) == 0) {
+            if ((exit_inout % 10) == 0) {
                 qemu_clock_run_timers(QEMU_CLOCK_VIRTUAL);
+                qemu_clock_run_timers(QEMU_CLOCK_REALTIME);
                 {
                     AioContext *ctx = qemu_get_aio_context();
                     timerlistgroup_run_timers(&ctx->tlg);
@@ -1829,9 +2197,36 @@ static int bhyve_vcpu_run(CPUState *cpu) {
                 }
             }
             bql_unlock();
+            if ((exit_inout % 200) == 0) {
+                sched_yield();
+            }
             break;
         case VM_EXITCODE_INST_EMUL:
             bql_lock();
+            {
+                /* Trace MMIO accesses to PCI MMIO window.
+                 * Separate counters for UEFI (early) and kernel (late). */
+                uint64_t mmio_gpa = vme.u.inst_emul.gpa;
+                static int mmio_uefi_log = 0;
+                static int mmio_kern_log = 0;
+                bool is_kernel = (vme.rip >= 0xffffffff80000000ULL);
+                if (mmio_gpa >= 0xc0000000ULL && mmio_gpa < 0x100000000ULL) {
+                    if (is_kernel) {
+                        if (mmio_kern_log < 100) {
+                            fprintf(stderr, "MMIO_KERN: GPA=0x%lx rip=0x%lx vie_valid=%d\n",
+                                    (unsigned long)mmio_gpa,
+                                    (unsigned long)vme.rip,
+                                    vme.u.inst_emul.vie.num_valid);
+                            mmio_kern_log++;
+                        }
+                    } else if (mmio_uefi_log < 10) {
+                        fprintf(stderr, "MMIO_UEFI: GPA=0x%lx rip=0x%lx\n",
+                                (unsigned long)mmio_gpa,
+                                (unsigned long)vme.rip);
+                        mmio_uefi_log++;
+                    }
+                }
+            }
             rc = vm_assist_qmem(qcpu->vcpu, vmm_mem_callback, &vme);
             if (rc == 0) {
                 mmio_kernel_ok++;
@@ -2118,7 +2513,16 @@ static int bhyve_vcpu_run(CPUState *cpu) {
                 rc = 1;
                 break;
             case VM_SUSPEND_HALT:
-                /* Treat halt-suspend as non-fatal — just re-enter */
+                /*
+                 * Halt-suspend: for APs this means the vCPU is in wait-
+                 * for-SIPI state. Put it into halted and exit the run
+                 * loop. For BSP, just re-enter.
+                 */
+                if (cpu->cpu_index > 0) {
+                    cpu->halted = true;
+                    cpu->exception_index = EXCP_HLT;
+                    rc = EXCP_HLT;
+                }
                 break;
             case VM_SUSPEND_TRIPLEFAULT:
                 fprintf(stderr, "VM triple fault at rip=0x%lx\n",
@@ -2341,6 +2745,61 @@ static int bhyve_vcpu_run(CPUState *cpu) {
             bql_unlock();
             break;
         }
+        case VM_EXITCODE_SPINUP_AP: {
+            /*
+             * SPINUP_AP: the kernel wants to activate an AP.
+             * This is the kernel-side counterpart of SIPI — the kernel
+             * already handled INIT/SIPI at the APIC level and is telling
+             * userspace to start the AP thread. We activate and resume
+             * the target vCPU in the kernel.
+             *
+             * vme.u.spinup_ap.vcpu is the target AP index,
+             * vme.u.spinup_ap.rip is the entry point (SIPI vector << 12).
+             */
+            int ap_idx = vme.u.spinup_ap.vcpu;
+            uint64_t ap_rip = vme.u.spinup_ap.rip;
+
+            bql_lock();
+            CPUState *ap_cs = qemu_get_cpu(ap_idx);
+            if (ap_cs && ap_cs->accel) {
+                AccelCPUState *ap_qcpu = ap_cs->accel;
+                X86CPU *ap_x86 = X86_CPU(ap_cs);
+
+                vm_activate_cpu(ap_qcpu->vcpu);
+
+                /* Set SIPI vector and signal the AP thread */
+                ap_x86->apic_state->sipi_vector = (uint8_t)(ap_rip >> 12);
+                cpu_interrupt(ap_cs, CPU_INTERRUPT_INIT);
+                cpu_interrupt(ap_cs, CPU_INTERRUPT_SIPI);
+
+                ap_cs->halted = false;
+                ap_cs->stopped = false;
+                ap_qcpu->dirty = true;
+
+                fprintf(stderr, "*** SPINUP_AP[%d]: activating AP%d at RIP=0x%lx\n",
+                        cpu->cpu_index, ap_idx, (unsigned long)ap_rip);
+            } else {
+                fprintf(stderr, "*** SPINUP_AP: no CPUState for AP%d!\n", ap_idx);
+            }
+            bql_unlock();
+            break;
+        }
+        case VM_EXITCODE_IOAPIC_EOI: {
+            /*
+             * IOAPIC_EOI: the guest wrote to the LAPIC EOI register for
+             * a level-triggered IOAPIC interrupt. The kernel tells us
+             * the vector so we can notify QEMU's IOAPIC model to deassert
+             * the pin. Without this, level-triggered interrupts (e.g.,
+             * ACPI SCI, PCI INTx) never re-trigger.
+             */
+            int eoi_vector = vme.u.ioapic_eoi.vector;
+            bql_lock();
+            /* Notify QEMU's IOAPIC that this vector was EOI'd.
+             * For now just re-enter — the kernel handles most of it. */
+            (void)eoi_vector;
+            bql_unlock();
+            break;
+        }
         default:
             exit_other++;
             printf("Unhandled exit (code=%d). Register Dump...\n", exitcode);
@@ -2351,6 +2810,7 @@ static int bhyve_vcpu_run(CPUState *cpu) {
             break;
         }
 	}
+abort_vcpu_loop:
 
     cpu_exec_end(cpu);
     bql_lock();
@@ -2464,15 +2924,27 @@ int bhyve_init_vcpu(CPUState *cpu)
     }
 
     {
-        /* Activate+suspend ALL vCPUs (BSP and APs).
-         * Activate makes the vCPU visible in vm_active_cpus(),
-         * which is needed for:
-         *  - BSP: normal operation
-         *  - APs: so vlapic_calcdest() includes them in IPI targets
-         * Suspend sets debug_cpus so vm_resume_cpu works on first vm_run.
+        /*
+         * Activate ALL vCPUs in the kernel so that the LAPIC model
+         * can deliver INIT+SIPI IPIs between them. Without this,
+         * the kernel's vlapic_calcdest() can't find inactive APs
+         * and SPINUP_AP exits are never generated.
+         *
+         * BSP: activate + suspend so it starts running.
+         * APs: activate + suspend so they exist in the kernel LAPIC
+         *      model. They stay halted in QEMU (wait-for-SIPI) and
+         *      won't enter vm_run until SPINUP_AP arrives.
          */
         err = vm_activate_cpu(qcpu->vcpu);
+        if (err) {
+            fprintf(stderr, "*** vm_activate_cpu(%d) failed: %d\n",
+                    cpu->cpu_index, err);
+        }
         err = vm_suspend_cpu(qcpu->vcpu);
+        if (err) {
+            fprintf(stderr, "*** vm_suspend_cpu(%d) failed: %d\n",
+                    cpu->cpu_index, err);
+        }
     }
 
     // Sync registers on exec
@@ -2513,6 +2985,18 @@ int bhyve_vcpu_exec(CPUState *cpu)
         if (cpu->exception_index >= EXCP_INTERRUPT) {
             ret = cpu->exception_index;
             cpu->exception_index = -1;
+            break;
+        }
+
+        /*
+         * Only resume+run APs that have received SIPI (not halted).
+         * APs in wait-for-SIPI state must not enter vm_run — the kernel
+         * would either return SUSPENDED or execute from an undefined RIP.
+         * QEMU's main loop handles the halt_cond wait.
+         */
+        if (cpu->halted) {
+            cpu->exception_index = EXCP_HLT;
+            ret = EXCP_HLT;
             break;
         }
 
@@ -2937,6 +3421,15 @@ static int
 bhyve_accel_init(AccelState *as, MachineState *ms)
 {
     int err;
+
+    /*
+     * Make stderr fully unbuffered so diagnostic output survives host
+     * freezes (data in the C buffer is lost if the machine hangs before
+     * fflush).  With line- or block-buffered stderr redirected to a
+     * file, a hard lockup produces a 0-byte log — useless for diagnosis.
+     */
+    setbuf(stderr, NULL);
+
     printf("Bhyve Accelerator Machine Initialization\n");
     atexit(mmio_print_stats);
 

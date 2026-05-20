@@ -111,7 +111,15 @@ void acpi_build_madt(GArray *table_data, BIOSLinker *linker,
     build_append_int_noprefix(table_data,
                               x86ms->pic != ON_OFF_AUTO_OFF ? 1 : 0 , 4);
 
+    fprintf(stderr, "*** MADT: building with %d possible CPUs (max_cpus=%d, cpus=%d)\n",
+            apic_ids->len,
+            MACHINE(x86ms)->smp.max_cpus,
+            MACHINE(x86ms)->smp.cpus);
     for (i = 0; i < apic_ids->len; i++) {
+        fprintf(stderr, "*** MADT: CPU[%d] arch_id=%u cpu=%p flags=%d\n",
+                i, (unsigned)apic_ids->cpus[i].arch_id,
+                apic_ids->cpus[i].cpu,
+                apic_ids->cpus[i].cpu != NULL ? 1 : 0);
         pc_madt_cpu_entry(i, apic_ids, table_data, false);
         if (apic_ids->cpus[i].arch_id > 254) {
             x2apic_mode = true;

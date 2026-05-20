@@ -1844,34 +1844,13 @@ static void pci_irq_handler(void *opaque, int irq_num, int level)
     assert(0 <= irq_num && irq_num < PCI_NUM_PINS);
     assert(level == 0 || level == 1);
     change = level - pci_irq_state(pci_dev, irq_num);
-    if (!change) {
-        /* Debug: trace when level=1 assertion is suppressed (stale state) */
-        if (level == 1) {
-            static int stale_log = 0;
-            if (stale_log < 10) {
-                fprintf(stderr, "PCI_IRQ_STALE: dev=%s slot=%d irq=%d "
-                        "level=1 already_asserted (state=%d)\n",
-                        pci_dev->name, PCI_SLOT(pci_dev->devfn),
-                        irq_num, pci_irq_state(pci_dev, irq_num));
-                stale_log++;
-            }
-        }
+    if (!change)
         return;
-    }
 
     pci_set_irq_state(pci_dev, irq_num, level);
     pci_update_irq_status(pci_dev);
-    if (pci_irq_disabled(pci_dev)) {
-        static int intx_dis_log = 0;
-        if (intx_dis_log < 10) {
-            uint16_t cmd = pci_get_word(pci_dev->config + PCI_COMMAND);
-            fprintf(stderr, "PCI_IRQ_DISABLED: dev=%s slot=%d irq=%d level=%d "
-                    "cmd=0x%x\n", pci_dev->name, PCI_SLOT(pci_dev->devfn),
-                    irq_num, level, cmd);
-            intx_dis_log++;
-        }
+    if (pci_irq_disabled(pci_dev))
         return;
-    }
     pci_change_irq_level(pci_dev, irq_num, change);
 
     /* Fire IOAPIC pin 16+irq_num for APIC-mode PCI interrupt routing.
