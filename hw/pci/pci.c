@@ -57,6 +57,22 @@
 
 bool pci_available = true;
 
+/*
+ * PCI INTx → IOAPIC direct routing hook.
+ * On real hardware, PCI INTx lines are wired directly to IOAPIC pins 16+.
+ * PIIX3 PIRQ routing only handles the PIC path. Guests in APIC mode
+ * (e.g. FreeBSD) expect interrupts on IOAPIC pins 16+irq_num.
+ * This hook is set by the machine init code to fire the correct GSI.
+ */
+static void (*pci_intx_ioapic_hook)(void *opaque, int pin, int level);
+static void *pci_intx_ioapic_opaque;
+
+void pci_register_intx_ioapic_hook(void (*hook)(void *, int, int), void *opaque)
+{
+    pci_intx_ioapic_hook = hook;
+    pci_intx_ioapic_opaque = opaque;
+}
+
 static char *pcibus_get_dev_path(DeviceState *dev);
 static char *pcibus_get_fw_dev_path(DeviceState *dev);
 static void pcibus_reset_hold(Object *obj, ResetType type);
@@ -1828,14 +1844,42 @@ static void pci_irq_handler(void *opaque, int irq_num, int level)
     assert(0 <= irq_num && irq_num < PCI_NUM_PINS);
     assert(level == 0 || level == 1);
     change = level - pci_irq_state(pci_dev, irq_num);
-    if (!change)
+    if (!change) {
+        /* Debug: trace when level=1 assertion is suppressed (stale state) */
+        if (level == 1) {
+            static int stale_log = 0;
+            if (stale_log < 10) {
+                fprintf(stderr, "PCI_IRQ_STALE: dev=%s slot=%d irq=%d "
+                        "level=1 already_asserted (state=%d)\n",
+                        pci_dev->name, PCI_SLOT(pci_dev->devfn),
+                        irq_num, pci_irq_state(pci_dev, irq_num));
+                stale_log++;
+            }
+        }
         return;
+    }
 
     pci_set_irq_state(pci_dev, irq_num, level);
     pci_update_irq_status(pci_dev);
-    if (pci_irq_disabled(pci_dev))
+    if (pci_irq_disabled(pci_dev)) {
+        static int intx_dis_log = 0;
+        if (intx_dis_log < 10) {
+            uint16_t cmd = pci_get_word(pci_dev->config + PCI_COMMAND);
+            fprintf(stderr, "PCI_IRQ_DISABLED: dev=%s slot=%d irq=%d level=%d "
+                    "cmd=0x%x\n", pci_dev->name, PCI_SLOT(pci_dev->devfn),
+                    irq_num, level, cmd);
+            intx_dis_log++;
+        }
         return;
+    }
     pci_change_irq_level(pci_dev, irq_num, change);
+
+    /* Fire IOAPIC pin 16+irq_num for APIC-mode PCI interrupt routing.
+     * irq_num is the original INTx pin (0=INTA, 1=INTB, etc.) BEFORE
+     * PIRQ remapping, which matches the IOAPIC PCI pin convention. */
+    if (pci_intx_ioapic_hook) {
+        pci_intx_ioapic_hook(pci_intx_ioapic_opaque, 16 + irq_num, level);
+    }
 }
 
 qemu_irq pci_allocate_irq(PCIDevice *pci_dev)

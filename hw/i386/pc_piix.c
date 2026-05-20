@@ -98,6 +98,16 @@ static void piix_intx_routing_notifier_xen(PCIDevice *dev)
     }
 }
 
+/* PCI INTx → IOAPIC direct routing callback.
+ * Fires GSI pin (16+irq_num) when a PCI device asserts/deasserts. */
+static void pc_pci_intx_ioapic_hook(void *opaque, int pin, int level)
+{
+    qemu_irq *gsi = opaque;
+    if (pin >= 16 && pin < 24) {
+        qemu_set_irq(gsi[pin], level);
+    }
+}
+
 /* PC hardware initialisation */
 static void pc_init1(MachineState *machine, const char *pci_type)
 {
@@ -285,6 +295,13 @@ static void pc_init1(MachineState *machine, const char *pci_type)
     }
 
     ioapic_init_gsi(gsi_state, phb);
+
+    /* Register PCI INTx → IOAPIC direct routing hook.
+     * On real hardware, PCI INTx pins are wired directly to IOAPIC pins 16+.
+     * PIIX3 PIRQ routing only handles the legacy PIC path (ISA IRQs 0-15).
+     * Guests in APIC mode (FreeBSD, Linux) program IOAPIC pins 16+ for PCI
+     * devices, so we must deliver interrupts there independently of PIRQ. */
+    pci_register_intx_ioapic_hook(pc_pci_intx_ioapic_hook, x86ms->gsi);
 
     if (tcg_enabled()) {
         x86_register_ferr_irq(x86ms->gsi[13]);

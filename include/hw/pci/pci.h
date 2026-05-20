@@ -308,6 +308,8 @@ PCIBus *pci_root_bus_new(DeviceState *parent, const char *name,
 void pci_root_bus_cleanup(PCIBus *bus);
 void pci_bus_irqs(PCIBus *bus, pci_set_irq_fn set_irq,
                   void *irq_opaque, int nirq);
+void pci_register_intx_ioapic_hook(void (*hook)(void *, int, int),
+                                   void *opaque);
 void pci_bus_map_irqs(PCIBus *bus, pci_map_irq_fn map_irq);
 void pci_bus_irqs_cleanup(PCIBus *bus);
 int pci_bus_get_irq_level(PCIBus *bus, int irq_num);
