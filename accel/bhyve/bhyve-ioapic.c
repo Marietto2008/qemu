@@ -49,20 +49,6 @@ static void bhyve_ioapic_set_irq(void *opaque, int irq, int level)
     int err;
     int pin = (irq == 0) ? 2 : irq;
 
-    /* Debug: trace IOAPIC IRQ assertions for PCI pins (16+) */
-    if (pin >= 16 && level) {
-        static int ioapic_pci_log = 0;
-        if (ioapic_pci_log < 30) {
-            uint64_t rte = (pin < 24) ? common->ioredtbl[pin] : 0;
-            uint8_t vec = rte & 0xFF;
-            int masked = (rte >> 16) & 1;
-            fprintf(stderr, "IOAPIC_SET_IRQ: irq=%d pin=%d level=%d "
-                    "rte=0x%lx vec=%d(0x%x) masked=%d\n",
-                    irq, pin, level, (unsigned long)rte, vec, vec, masked);
-            ioapic_pci_log++;
-        }
-    }
-
     ioapic_stat_update_irq(common, irq, level);
 
     if (level) {
@@ -210,18 +196,6 @@ bhyve_ioapic_mem_write(void *opaque, hwaddr addr, uint64_t val,
                     bhyve_ioapic_vectors[index] = vec;
                 }
 
-                /* Debug: trace ALL IOAPIC RTE writes */
-                {
-                    static int rte_log = 0;
-                    if (rte_log < 60) {
-                        int masked_rte = (s->ioredtbl[index] >> 16) & 1;
-                        fprintf(stderr, "IOAPIC_RTE_WR: pin=%d rte=0x%lx "
-                                "vec=%d(0x%x) masked=%d\n",
-                                index, (unsigned long)s->ioredtbl[index],
-                                vec, vec, masked_rte);
-                        rte_log++;
-                    }
-                }
             }
         }
         break;

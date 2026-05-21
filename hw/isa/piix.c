@@ -78,17 +78,6 @@ static void piix_set_pci_irq_level(PIIXState *s, int pirq, int level)
 static void piix_set_pci_irq(void *opaque, int pirq, int level)
 {
     PIIXState *s = opaque;
-    int pic_irq = s->dev.config[PIIX_PIRQCA + pirq];
-
-    /* Debug: trace PCI IRQ routing */
-    {
-        static int pci_irq_log = 0;
-        if (pci_irq_log < 30) {
-            fprintf(stderr, "PIIX_PCI_IRQ: pirq=%d level=%d pic_irq=%d "
-                    "ioapic_pin=%d\n", pirq, level, pic_irq, 16 + pirq);
-            pci_irq_log++;
-        }
-    }
 
     piix_set_pci_irq_level(s, pirq, level);
 }

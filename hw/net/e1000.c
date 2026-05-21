@@ -1131,19 +1131,19 @@ set_ims(E1000State *s, int index, uint32_t val)
     s->mac_reg[IMS] |= val;
 
     /*
-     * Bhyve fix: when RX interrupt (RXT0) is newly enabled, fire a
-     * gratuitous RXT0 interrupt. This handles packets that arrived
-     * while IMS=0 (e.g. DHCP offers during em driver init) whose ICR
-     * bits were cleared by driver reads before IMS was set.
-     * A spurious RX interrupt is harmless — the driver just checks
-     * the RX ring and returns if empty.
-     * Also flush queued packets from the backend (SLIRP) in case any
-     * were held back while the NIC wasn't ready.
+     * Bhyve fix: when RX interrupt (RXT0) is newly enabled, flush
+     * queued packets from the backend (SLIRP) in case any were held
+     * back while the NIC wasn't ready. The flush will deliver packets
+     * through the normal receive path, which sets ICR naturally.
+     *
+     * NOTE: Do NOT fire a gratuitous set_ics(RXT0) here. The FreeBSD
+     * em(4) driver ISR clears IMS (via IMC) then re-enables it. If we
+     * fire a gratuitous interrupt on every IMS re-enable, it creates
+     * an infinite loop: gratuitous IRQ → ISR → IMC → IMS → gratuitous...
+     * This loop generates millions of interrupts/sec and freezes the host.
      */
     if (!(old_ims & E1000_ICS_RXT0) && (s->mac_reg[IMS] & E1000_ICS_RXT0)) {
         qemu_flush_queued_packets(qemu_get_queue(s->nic));
-        set_ics(s, 0, E1000_ICS_RXT0);
-        return;
     }
 
     set_ics(s, 0, 0);
