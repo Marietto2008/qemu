@@ -9,6 +9,12 @@
 #include "qom/object.h"
 #include "bhyve-internal.h"
 
+#ifndef BHYVE_DEBUG
+#define BHYVE_DEBUG 0
+#endif
+#define BHYVE_DPRINTF(fmt, ...) \
+    do { if (BHYVE_DEBUG) fprintf(stderr, fmt, ## __VA_ARGS__); } while (0)
+
 /**
  * BhyvePICClass:
  * @parent_realize: The parent's realizefn.
@@ -42,10 +48,6 @@ static void bhyve_pic_reset(DeviceState *dev)
     bhyve_pic_put(s);
 }
 
-volatile long pic_irq0_assert = 0;
-volatile long pic_irq0_deassert = 0;
-volatile long pic_other_irq = 0;
-
 /*
  * Bitmask of pending ISA IRQs for userspace injection.
  * Set by bhyve_pic_set_irq when level=1, cleared by pre_run
@@ -58,48 +60,67 @@ static void bhyve_pic_set_irq(void *opaque, int irq, int level)
     int err;
     pic_stat_update_irq(irq, level);
 
-    if (irq == 0) {
-        if (level) pic_irq0_assert++;
-        else pic_irq0_deassert++;
-    } else {
-        pic_other_irq++;
-    }
-
-    if (level) {
-        err = vm_isa_assert_irq(bhyve_mach.vm, irq, -1);
-        /* Track pending IRQ for userspace injection in pre_run */
-        __atomic_or_fetch(&bhyve_pic_pending_irqs, (1u << irq), __ATOMIC_RELEASE);
-    } else {
-        err = vm_isa_deassert_irq(bhyve_mach.vm, irq, -1);
+    /*
+     * Map ISA IRQ to IOAPIC pin (IRQ0→pin2, others→same pin#).
+     * Pass BOTH vatpic IRQ and vioapic pin so the kernel updates
+     * both interrupt controllers. Critical for SCI (IRQ 9): the
+     * BHYVE firmware asserts SCI via the kernel's vioapic directly,
+     * so we must deassert in the vioapic too, not just vatpic.
+     */
+    {
+        int ioapic_pin = (irq == 0) ? 2 : irq;
+        if (level) {
+            err = vm_isa_assert_irq(bhyve_mach.vm, irq, ioapic_pin);
+            /* Track pending IRQ for userspace injection in pre_run */
+            __atomic_or_fetch(&bhyve_pic_pending_irqs, (1u << irq), __ATOMIC_RELEASE);
+        } else {
+            err = vm_isa_deassert_irq(bhyve_mach.vm, irq, ioapic_pin);
+        }
     }
 
     /*
-     * Inject directly into kernel vLAPIC so sleeping vCPUs wake
-     * immediately.  Also set CPU_INTERRUPT_HARD for pre_run fallback.
+     * Wake the target vCPU so it picks up the pending IRQ in pre_run.
+     * The actual vLAPIC injection happens in pre_run via vm_lapic_msi.
+     *
+     * Also inject directly via bhyve_inject_lapic_irq (which uses
+     * vm_lapic_msi — no vCPU locking) to wake vCPUs sleeping in the
+     * kernel HLT handler.  vm_lapic_msi sets the IRR and calls
+     * vcpu_notify_event to wake VCPU_SLEEPING vCPUs.
      */
     if (level) {
-        CPUState *cpu = first_cpu;
-        if (cpu) {
-            /* Direct injection: map ISA IRQ to IOAPIC vector and inject.
-             * If IOAPIC not yet programmed (early boot/BIOS), use PIC
-             * vector as fallback so the kernel HLT handler wakes up. */
-            int pic_pin = (irq == 0) ? 2 : irq;
-            int vec = 0;
-            if (pic_pin < 24) {
-                vec = bhyve_ioapic_vectors[pic_pin];
+        int pic_pin = (irq == 0) ? 2 : irq;
+        int vec = 0;
+        if (pic_pin < 24) {
+            vec = bhyve_ioapic_vectors[pic_pin];
+        }
+        if (vec < 0x10) {
+            /* IOAPIC not configured yet — use PIC vector */
+            vec = (irq < 8) ? (0x20 + irq) : (0x28 + irq - 8);
+        }
+
+        /* Find target CPU from IOAPIC destination cache */
+        CPUState *target = first_cpu;
+        if (pic_pin < 24) {
+            uint8_t dest_id = bhyve_ioapic_destinations[pic_pin];
+            if (dest_id != 0xFF) {
+                CPUState *cs;
+                CPU_FOREACH(cs) {
+                    if (cs->cpu_index == dest_id) {
+                        target = cs;
+                        break;
+                    }
+                }
             }
-            if (vec < 0x10) {
-                /* IOAPIC not configured yet — use PIC vector */
-                vec = (irq < 8) ? (0x20 + irq) : (0x28 + irq - 8);
-            }
-            bhyve_inject_lapic_irq(cpu, vec);
-            cpu_interrupt(cpu, CPU_INTERRUPT_HARD);
+        }
+        if (target) {
+            bhyve_inject_lapic_irq(target, vec);
+            cpu_interrupt(target, CPU_INTERRUPT_HARD);
         }
     }
 
     if (err) {
-        fprintf(stderr, "bhyve: 8259 failed, irq (%d) err=%d errno=%d (%s)\n",
-                irq, err, errno, strerror(errno));
+        BHYVE_DPRINTF("bhyve: 8259 failed, irq (%d) err=%d errno=%d\n",
+                      irq, err, errno);
     }
 }
 

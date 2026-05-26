@@ -435,9 +435,18 @@ void acpi_pm1_evt_reset(ACPIREGS *ar)
 static uint64_t acpi_pm_evt_read(void *opaque, hwaddr addr, unsigned width)
 {
     ACPIREGS *ar = opaque;
+    static int rd_diag = 0;
+    uint64_t val;
     switch (addr) {
     case 0:
-        return acpi_pm1_evt_get_sts(ar);
+        val = acpi_pm1_evt_get_sts(ar);
+        if (val && rd_diag < 30) {
+            rd_diag++;
+            fprintf(stderr, "[ACPI-RD] #%d PM1_STS=0x%04x PM1_EN=0x%04x overflow=%lld\n",
+                    rd_diag, (unsigned)val, (unsigned)ar->pm1.evt.en,
+                    (long long)ar->tmr.overflow_time);
+        }
+        return val;
     case 2:
         return ar->pm1.evt.en;
     default:
@@ -445,10 +454,20 @@ static uint64_t acpi_pm_evt_read(void *opaque, hwaddr addr, unsigned width)
     }
 }
 
+
 static void acpi_pm_evt_write(void *opaque, hwaddr addr, uint64_t val,
                               unsigned width)
 {
     ACPIREGS *ar = opaque;
+    /* Debug: uncomment to trace ACPI PM1 event writes
+    static int wr_diag = 0;
+    if (wr_diag < 30) {
+        wr_diag++;
+        fprintf(stderr, "[ACPI-WR] #%d addr=%d val=0x%04x (before: sts=0x%04x en=0x%04x)\n",
+                wr_diag, (int)addr, (unsigned)val,
+                (unsigned)acpi_pm1_evt_get_sts(ar), (unsigned)ar->pm1.evt.en);
+    }
+    */
     switch (addr) {
     case 0:
         acpi_pm1_evt_write_sts(ar, val);
@@ -460,6 +479,7 @@ static void acpi_pm_evt_write(void *opaque, hwaddr addr, uint64_t val,
         break;
     }
 }
+
 
 static const MemoryRegionOps acpi_pm_evt_ops = {
     .read = acpi_pm_evt_read,
@@ -553,7 +573,8 @@ void acpi_pm_tmr_init(ACPIREGS *ar, acpi_update_sci_fn update_sci,
 
 void acpi_pm_tmr_reset(ACPIREGS *ar)
 {
-    ar->tmr.overflow_time = 0;
+    /* Set first overflow at 0x800000 ticks (~2.3s), not 0 (always-expired) */
+    ar->tmr.overflow_time = 0x100000000LL; /* ~19.8 min at 3.58MHz — never fires during boot */
     timer_del(ar->tmr.timer);
 }
 
@@ -737,12 +758,21 @@ void acpi_send_gpe_event(ACPIREGS *ar, qemu_irq irq,
 void acpi_update_sci(ACPIREGS *regs, qemu_irq irq)
 {
     int sci_level, pm1a_sts;
+    static int sci_diag_count = 0;
 
     pm1a_sts = acpi_pm1_evt_get_sts(regs);
 
     sci_level = ((pm1a_sts &
                   regs->pm1.evt.en & ACPI_BITMASK_PM1_COMMON_ENABLED) != 0) ||
                 ((regs->gpe.sts[0] & regs->gpe.en[0]) != 0);
+
+    if (sci_level && sci_diag_count < 20) {
+        sci_diag_count++;
+        fprintf(stderr, "[ACPI-SCI] #%d: pm1_sts=0x%04x pm1_en=0x%04x gpe_sts=0x%02x gpe_en=0x%02x overflow_time=%lld\n",
+                sci_diag_count, (unsigned)pm1a_sts, (unsigned)regs->pm1.evt.en,
+                (unsigned)regs->gpe.sts[0], (unsigned)regs->gpe.en[0],
+                (long long)regs->tmr.overflow_time);
+    }
 
     qemu_set_irq(irq, sci_level);
 

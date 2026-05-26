@@ -41,6 +41,7 @@
 #include "qemu/cutils.h"
 #include "system/replay.h"
 #include "system/runstate.h"
+#include "system/bhyve.h"
 #include "ide-internal.h"
 #include "trace.h"
 
@@ -2360,6 +2361,16 @@ void ide_ctrl_write(void *opaque, uint32_t addr, uint32_t val)
 
     trace_ide_ctrl_write(addr, val, bus);
 
+    /* Diagnostic: trace nIEN changes */
+    {
+        static long ctrl_write_count = 0;
+        ctrl_write_count++;
+        if (ctrl_write_count <= 50 || (ctrl_write_count % 100) == 0) {
+            fprintf(stderr, "[IDE-CTRL] #%ld addr=0x%x val=0x%02x old_cmd=0x%02x nIEN=%d\n",
+                    ctrl_write_count, addr, val, bus->cmd, (val & 0x02) ? 1 : 0);
+        }
+    }
+
     /* Device0 and Device1 each have their own control register,
      * but QEMU models it as just one register in the controller. */
     if (!(bus->cmd & IDE_CTRL_RESET) && (val & IDE_CTRL_RESET)) {
@@ -2808,7 +2819,13 @@ void ide_bus_init_output_irq(IDEBus *bus, qemu_irq irq_out)
 
 void ide_bus_set_irq(IDEBus *bus)
 {
-    if (!(bus->cmd & IDE_CTRL_DISABLE_IRQ)) {
+    /*
+     * bhyve workaround: the guest's ATA probe sequence leaves nIEN=1
+     * in the control register (port 0x3F6) and never clears it,
+     * because bhyve's I/O emulation timing differs from hardware.
+     * Skip the nIEN check for bhyve so IDE interrupts are delivered.
+     */
+    if (bhyve_enabled() || !(bus->cmd & IDE_CTRL_DISABLE_IRQ)) {
         qemu_irq_raise(bus->irq);
     }
 }

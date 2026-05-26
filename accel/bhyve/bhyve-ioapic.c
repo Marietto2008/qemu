@@ -6,6 +6,12 @@
 #include "exec/cpu-interrupt.h"
 #include "bhyve-internal.h"
 
+#ifndef BHYVE_DEBUG
+#define BHYVE_DEBUG 0
+#endif
+#define BHYVE_DPRINTF(fmt, ...) \
+    do { if (BHYVE_DEBUG) fprintf(stderr, fmt, ## __VA_ARGS__); } while (0)
+
 typedef struct BhyveIOAPICState BhyveIOAPICState;
 
 struct BhyveIOAPICState {
@@ -42,6 +48,13 @@ volatile uint32_t bhyve_ioapic_pending_irqs = 0;
  * Read from QEMU's own IOAPIC model (not the kernel's). */
 volatile uint8_t bhyve_ioapic_vectors[24] = {0};
 
+/* Destination table: stores the target LAPIC ID for each pin.
+ * Updated when guest programs IOAPIC RTEs via MMIO.
+ * 0xFF = broadcast/not configured (target first_cpu). */
+volatile uint8_t bhyve_ioapic_destinations[24] = {
+    [0 ... 23] = 0xFF
+};
+
 static void bhyve_ioapic_set_irq(void *opaque, int irq, int level)
 {
     BhyveIOAPICState *s = opaque;
@@ -73,26 +86,36 @@ static void bhyve_ioapic_set_irq(void *opaque, int irq, int level)
     }
 
     /*
-     * Inject directly into kernel vLAPIC so sleeping vCPUs wake
-     * immediately (vm_lapic_irq → vcpu_notify_event → wakeup).
-     * Also set CPU_INTERRUPT_HARD for the pre_run fallback path.
+     * Wake the correct target vCPU based on IOAPIC RTE destination.
+     *
+     * Do NOT inject directly into the kernel vLAPIC here — that would
+     * populate the IRR immediately, causing the HLT handler's IRR check
+     * to skip halting and creating a tight 100% CPU spin loop.
+     *
+     * Instead, just set CPU_INTERRUPT_HARD on the target vCPU to wake
+     * it from halt_cond. The actual injection happens in pre_run via
+     * vm_lapic_irq, timed correctly before vm_run entry.
      */
     if (level) {
-        /* Inject directly into kernel vLAPIC for immediate wakeup */
+        CPUState *target = first_cpu;
         if (pin < 24) {
             uint64_t rte = common->ioredtbl[pin];
-            uint8_t vec = rte & 0xFF;
-            int masked_bit = (rte >> 16) & 1;
-            if (!masked_bit && vec >= 0x10) {
-                CPUState *target = first_cpu;
-                if (target) {
-                    bhyve_inject_lapic_irq(target, vec);
+            uint8_t dest_id = (rte >> 56) & 0xFF;
+            int dest_mode = (rte >> 11) & 1; /* 0=physical, 1=logical */
+
+            if (dest_mode == 0 && dest_id != 0xFF) {
+                /* Physical mode: dest_id is LAPIC ID (== cpu_index) */
+                CPUState *cs;
+                CPU_FOREACH(cs) {
+                    if (cs->cpu_index == dest_id) {
+                        target = cs;
+                        break;
+                    }
                 }
             }
         }
-        CPUState *cpu = first_cpu;
-        if (cpu) {
-            cpu_interrupt(cpu, CPU_INTERRUPT_HARD);
+        if (target) {
+            cpu_interrupt(target, CPU_INTERRUPT_HARD);
         }
     }
 
@@ -188,13 +211,16 @@ bhyve_ioapic_mem_write(void *opaque, hwaddr addr, uint64_t val,
                     s->ioredtbl[index] &= ~((uint64_t)IOAPIC_LVT_REMOTE_IRR);
                 }
 
-                /* Update vector cache for interrupt injection.
+                /* Update vector and destination caches for interrupt injection.
                  * Keep the vector even when masked — the PIC path needs
                  * it to inject at the correct vector regardless of mask state. */
                 uint8_t vec = s->ioredtbl[index] & 0xFF;
                 if (vec >= 0x10) {
                     bhyve_ioapic_vectors[index] = vec;
                 }
+                /* Cache destination LAPIC ID for routing in pre_run */
+                uint8_t dest = (s->ioredtbl[index] >> 56) & 0xFF;
+                bhyve_ioapic_destinations[index] = dest;
 
             }
         }

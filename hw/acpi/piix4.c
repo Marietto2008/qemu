@@ -287,8 +287,10 @@ static void piix4_pm_reset(DeviceState *dev)
     pci_conf[0x5a] = 0;
     pci_conf[0x5b] = 0;
 
+    /* bhyve: set PM IO base to 0x400 and enable it at reset */
     pci_conf[0x40] = 0x01; /* PM io base read only bit */
-    pci_conf[0x80] = 0;
+    pci_conf[0x41] = 0x04; /* PM IO base = 0x400 */
+    pci_conf[0x80] = 0x01; /* Enable ACPI IO space */
 
     if (!s->smm_enabled) {
         /* Mark SMM as already inited (until KVM supports SMM). */
@@ -477,9 +479,12 @@ static void piix4_pm_realize(PCIDevice *dev, Error **errp)
                                 s->smb_io_base, &s->smb.io);
 
     memory_region_init(&s->io, OBJECT(s), "piix4-pm", 64);
-    memory_region_set_enabled(&s->io, false);
+    /* bhyve: pre-enable PM region at 0x400 so guest sees valid PM1 registers
+     * before firmware configures PCI. Without this, reads return 0xFFFF
+     * causing ACPI fixed event storm with >2 CPUs. */
+    memory_region_set_enabled(&s->io, true);
     memory_region_add_subregion(pci_address_space_io(dev),
-                                0, &s->io);
+                                0x400, &s->io);
 
     acpi_pm_tmr_init(&s->ar, pm_tmr_timer, &s->io);
     acpi_pm1_evt_init(&s->ar, pm_tmr_timer, &s->io);

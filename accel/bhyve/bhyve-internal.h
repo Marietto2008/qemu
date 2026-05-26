@@ -43,11 +43,6 @@ struct bhyve_machine {
 
 extern struct bhyve_machine bhyve_mach;
 
-/* Diagnostic counters from bhyve-i8259.c */
-extern volatile long pic_irq0_assert;
-extern volatile long pic_irq0_deassert;
-extern volatile long pic_other_irq;
-
 /* Pending ISA IRQ bitmask for userspace injection (bhyve-i8259.c) */
 extern volatile uint32_t bhyve_pic_pending_irqs;
 
@@ -56,6 +51,10 @@ extern volatile uint32_t bhyve_ioapic_pending_irqs;
 
 /* IOAPIC vector table — set by bhyve_ioapic_set_irq from QEMU's model */
 extern volatile uint8_t bhyve_ioapic_vectors[24];
+
+/* IOAPIC destination table — LAPIC ID per pin, set when guest programs RTEs.
+ * 0xFF = not configured / broadcast (target first_cpu). */
+extern volatile uint8_t bhyve_ioapic_destinations[24];
 
 /*
  * Inject an interrupt vector directly into a vCPU's kernel vLAPIC.
