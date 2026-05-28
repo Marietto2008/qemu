@@ -6,6 +6,7 @@ bhyve_ss.add(files(
   'bhyve-apic.c',
   'bhyve-ioapic.c',
   'bhyve-i8259.c',
+  'bhyve-passthru.c',
 ))
 
 # Aggiungi la dipendenza da libvmmapi
