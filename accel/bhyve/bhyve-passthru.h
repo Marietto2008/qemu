@@ -48,8 +48,14 @@ struct BhyvePassthruState {
     /* NVIDIA GPU quirk: PCI config space mirrored at BAR0+0x88000 */
     bool is_nvidia_gpu;
 
-    /* Cached PCI config — read before PPT assignment, PCIOCREAD blocks after */
-    uint8_t host_config[256];
+    /* Cached PCI config — read before PPT assignment.
+     * Full 4KB PCIe extended config space (0x000-0xFFF).
+     * NVIDIA driver reads extended caps through BAR0+0x88000 mirror. */
+    uint8_t host_config[4096];
+
+    /* Index into bhyve_passthru_msi_vectors[] for IRR scrub protection, or -1 */
+    int msi_scrub_idx;
+
 };
 
 #endif /* BHYVE_PASSTHRU_H */
