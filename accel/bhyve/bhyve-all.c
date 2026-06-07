@@ -36,6 +36,20 @@
 #include <vmmapi.h>
 #include <machine/vmm_dev.h>
 
+/* Atomic IRR clearing ioctl — avoids TOCTOU race of GET_STATE/SET_STATE */
+#ifndef VM_LAPIC_CLEAR_IRR
+struct vm_lapic_clear_irr {
+    uint32_t irr_mask[8];
+};
+#define IOCNUM_LAPIC_CLEAR_IRR 130
+#define VM_LAPIC_CLEAR_IRR \
+    _IOW('v', IOCNUM_LAPIC_CLEAR_IRR, struct vm_lapic_clear_irr)
+#endif
+
+/* Passthrough MSI vectors protected from IRR scrubbing (from bhyve-passthru.c) */
+#define BHYVE_PASSTHRU_MSI_MAX 16
+extern volatile uint8_t bhyve_passthru_msi_vectors[BHYVE_PASSTHRU_MSI_MAX];
+
 /*
  * Debug output control.  Define BHYVE_DEBUG=1 to enable verbose
  * hot-path tracing (MMIO, HLT, IRQ injection, heartbeat, etc.).
@@ -189,71 +203,74 @@ static void write_guest_virt64(uint64_t cr3, uint64_t vaddr, uint64_t val) {
 static void scrub_lapic_bad_vectors(struct vcpu *vcpu, int cpu_index,
                                      long run_total)
 {
-    struct vm_lapic_state state;
-
-    memset(&state, 0, sizeof(state));
-
-    int err = vcpu_ioctl(vcpu, VM_LAPIC_GET_STATE, &state);
-    if (err < 0)
-        return;
-
-    int modified = 0;
+    /*
+     * Use atomic VM_LAPIC_CLEAR_IRR to scrub bad vectors from IRR.
+     * This avoids the TOCTOU race where GET_STATE/SET_STATE would
+     * read IRR, then write it back — destroying any IRR bits set by
+     * pptintr() between the read and write (e.g. MSI vector 33).
+     */
+    struct vm_lapic_clear_irr ci;
+    memset(&ci, 0, sizeof(ci));
 
     /* IRR[0]: vectors 0-31 — always clear ALL */
-    if (state.fields[0x20].data != 0) {
-        state.fields[0x20].data = 0;
-        modified = 1;
-    }
+    ci.irr_mask[0] = 0xFFFFFFFF;
 
-    /* IRR[1]: vectors 32-63 — clear stale vectors, but NOT vectors
-     * that are actively assigned to IOAPIC pins by the guest OS.
-     * Without this check, legitimate ATA interrupts (vec 0x20=32,
-     * assigned by Linux to IOAPIC pin 14) get scrubbed, causing
-     * "lost interrupt" errors and 30s boot timeouts. */
-    uint32_t irr1 = state.fields[0x21].data;
-    if (irr1) {
-        /* Build mask of vectors 32-63 that are live IOAPIC assignments */
+    /* IRR[1]: vectors 32-63 — clear only non-live vectors */
+    {
         uint32_t live_mask = 0;
         for (int p = 0; p < 24; p++) {
             uint8_t v = bhyve_ioapic_vectors[p];
-            if (v >= 32 && v < 64) {
+            if (v >= 32 && v < 64)
                 live_mask |= (1u << (v - 32));
-            }
         }
-        /* Only scrub vectors that are NOT live IOAPIC assignments */
-        uint32_t scrub_mask = irr1 & ~live_mask;
-        if (scrub_mask) {
-            state.fields[0x21].data = irr1 & ~scrub_mask;
-            modified = 1;
+        for (int m = 0; m < BHYVE_PASSTHRU_MSI_MAX; m++) {
+            uint8_t v = bhyve_passthru_msi_vectors[m];
+            if (v >= 32 && v < 64)
+                live_mask |= (1u << (v - 32));
         }
+        ci.irr_mask[1] = ~live_mask;
     }
 
-    /* IRR[2]: vectors 64-95 — same approach */
-    uint32_t irr2 = state.fields[0x22].data;
-    if (irr2) {
+    /* IRR[2]: vectors 64-95 — clear only non-live vectors */
+    {
         uint32_t live_mask2 = 0;
         for (int p = 0; p < 24; p++) {
             uint8_t v = bhyve_ioapic_vectors[p];
-            if (v >= 64 && v < 96) {
+            if (v >= 64 && v < 96)
                 live_mask2 |= (1u << (v - 64));
+        }
+        for (int m = 0; m < BHYVE_PASSTHRU_MSI_MAX; m++) {
+            uint8_t v = bhyve_passthru_msi_vectors[m];
+            if (v >= 64 && v < 96)
+                live_mask2 |= (1u << (v - 64));
+        }
+        ci.irr_mask[2] = ~live_mask2;
+    }
+
+    /* IRR[3]-IRR[7] (vectors 96-255): leave alone */
+
+    vcpu_ioctl(vcpu, VM_LAPIC_CLEAR_IRR, &ci);
+
+    /*
+     * LVT timer check: mask if vector < 32 (one-time fix at boot).
+     * Uses GET/SET_STATE but only until the timer is masked, then stops.
+     * The brief TOCTOU window here is acceptable since this path is
+     * transient and does not coincide with MSI setup.
+     */
+    static volatile int lvt_timer_fixed = 0;
+    if (!lvt_timer_fixed) {
+        struct vm_lapic_state state;
+        memset(&state, 0, sizeof(state));
+        int err = vcpu_ioctl(vcpu, VM_LAPIC_GET_STATE, &state);
+        if (err >= 0) {
+            uint32_t lvt_timer = state.fields[0x32].data;
+            if ((lvt_timer & 0xFF) < 32 && !((lvt_timer >> 16) & 1)) {
+                state.fields[0x32].data = lvt_timer | (1 << 16);
+                vcpu_ioctl(vcpu, VM_LAPIC_SET_STATE, &state);
+            } else {
+                lvt_timer_fixed = 1;
             }
         }
-        uint32_t scrub_mask2 = irr2 & ~live_mask2;
-        if (scrub_mask2) {
-            state.fields[0x22].data = irr2 & ~scrub_mask2;
-            modified = 1;
-        }
-    }
-
-    /* Check LVT Timer for low vector */
-    uint32_t lvt_timer = state.fields[0x32].data;
-    if ((lvt_timer & 0xFF) < 32 && !((lvt_timer >> 16) & 1)) {
-        state.fields[0x32].data = lvt_timer | (1 << 16);
-        modified = 1;
-    }
-
-    if (modified) {
-        vcpu_ioctl(vcpu, VM_LAPIC_SET_STATE, &state);
     }
 }
 
@@ -1828,14 +1845,8 @@ static int bhyve_vcpu_run(CPUState *cpu) {
          * In the FreeBSD kernel, those same vectors have no IDT handler
          * (Xrsvd) and cause trap 30.
          */
-        {
-            uint64_t scrub_rip = 0;
-            vm_get_register(qcpu->vcpu, VM_REG_GUEST_RIP, &scrub_rip);
-            if (scrub_rip >= 0xffffffff80000000ULL) {
-                scrub_lapic_bad_vectors(qcpu->vcpu, cpu->cpu_index,
-                                        qcpu->vcpu_vm_run_total);
-            }
-        }
+        /* IRR scrub disabled — only needed for FreeBSD guests (trap 30).
+         * Linux guests handle all vectors, no scrub needed. */
 
         /*
          * MASK_HWINTR safety net: prevent the bhyve kernel from injecting
@@ -1871,53 +1882,26 @@ static int bhyve_vcpu_run(CPUState *cpu) {
                 if (qcpu->smp_rearm_mask == 200) {
                     /* First entry: mask and selective scrub */
                     vm_set_capability(qcpu->vcpu, VM_CAP_MASK_HWINTR, 1);
-                    struct vm_lapic_state smp_lap;
-                    memset(&smp_lap, 0, sizeof(smp_lap));
-                    if (vcpu_ioctl(qcpu->vcpu, VM_LAPIC_GET_STATE,
-                                   &smp_lap) == 0) {
-                        int smp_mod = 0;
-                        /* Scrub firmware stale vectors 0-63 + vec 64 */
-                        if (smp_lap.fields[0x20].data != 0) {
-                            smp_lap.fields[0x20].data = 0; /* vec 0-31 */
-                            smp_mod = 1;
-                        }
-                        if (smp_lap.fields[0x21].data != 0) {
-                            smp_lap.fields[0x21].data = 0; /* vec 32-63 */
-                            smp_mod = 1;
-                        }
-                        if (smp_lap.fields[0x22].data & (1u << 0)) {
-                            smp_lap.fields[0x22].data &= ~(1u << 0); /* vec 64 */
-                            smp_mod = 1;
-                        }
-                        if (smp_mod) {
-                            vcpu_ioctl(qcpu->vcpu, VM_LAPIC_SET_STATE,
-                                       &smp_lap);
-                        }
+                    /* Atomic IRR scrub — no TOCTOU race */
+                    {
+                        struct vm_lapic_clear_irr ci;
+                        memset(&ci, 0, sizeof(ci));
+                        ci.irr_mask[0] = 0xFFFFFFFF; /* vec 0-31 */
+                        ci.irr_mask[1] = 0xFFFFFFFF; /* vec 32-63 */
+                        ci.irr_mask[2] = 0x00000001; /* vec 64 */
+                        vcpu_ioctl(qcpu->vcpu, VM_LAPIC_CLEAR_IRR, &ci);
                     }
                 }
                 qcpu->smp_rearm_mask--;
                 if (qcpu->smp_rearm_mask == 0) {
-                    /* SMP rearm over — selective scrub and unmask */
-                    struct vm_lapic_state final_lap;
-                    memset(&final_lap, 0, sizeof(final_lap));
-                    if (vcpu_ioctl(qcpu->vcpu, VM_LAPIC_GET_STATE,
-                                   &final_lap) == 0) {
-                        int fmod = 0;
-                        if (final_lap.fields[0x20].data != 0) {
-                            final_lap.fields[0x20].data = 0;
-                            fmod = 1;
-                        }
-                        if (final_lap.fields[0x21].data != 0) {
-                            final_lap.fields[0x21].data = 0;
-                            fmod = 1;
-                        }
-                        if (final_lap.fields[0x22].data & (1u << 0)) {
-                            final_lap.fields[0x22].data &= ~(1u << 0);
-                            fmod = 1;
-                        }
-                        if (fmod)
-                            vcpu_ioctl(qcpu->vcpu, VM_LAPIC_SET_STATE,
-                                       &final_lap);
+                    /* SMP rearm over — atomic scrub and unmask */
+                    {
+                        struct vm_lapic_clear_irr ci;
+                        memset(&ci, 0, sizeof(ci));
+                        ci.irr_mask[0] = 0xFFFFFFFF; /* vec 0-31 */
+                        ci.irr_mask[1] = 0xFFFFFFFF; /* vec 32-63 */
+                        ci.irr_mask[2] = 0x00000001; /* vec 64 */
+                        vcpu_ioctl(qcpu->vcpu, VM_LAPIC_CLEAR_IRR, &ci);
                     }
                     /*
                      * SMP re-arm expired: unconditionally unmask HWINTR
@@ -1975,32 +1959,13 @@ static int bhyve_vcpu_run(CPUState *cpu) {
                  * interrupts once the guest is running.
                  */
                 {
-                    struct vm_lapic_state sti_lap;
-                    memset(&sti_lap, 0, sizeof(sti_lap));
-                    if (vcpu_ioctl(qcpu->vcpu, VM_LAPIC_GET_STATE,
-                                   &sti_lap) == 0) {
-                        int smod = 0;
-                        /* Scrub IRR[0] (vectors 0-31: CPU exceptions) */
-                        if (sti_lap.fields[0x20].data != 0) {
-                            sti_lap.fields[0x20].data = 0;
-                            smod = 1;
-                        }
-                        /* Scrub ALL of IRR[1] (vectors 32-63:
-                         * firmware IOAPIC/PIC stale vectors including
-                         * SCI vec 48, PIT vec 50, etc.) */
-                        if (sti_lap.fields[0x21].data != 0) {
-                            sti_lap.fields[0x21].data = 0;
-                            smod = 1;
-                        }
-                        /* Scrub vector 64 (bit 0 in IRR[2]) */
-                        if (sti_lap.fields[0x22].data & (1u << 0)) {
-                            sti_lap.fields[0x22].data &= ~(1u << 0);
-                            smod = 1;
-                        }
-                        if (smod)
-                            vcpu_ioctl(qcpu->vcpu, VM_LAPIC_SET_STATE,
-                                       &sti_lap);
-                    }
+                    /* Atomic IRR scrub — firmware stale vectors */
+                    struct vm_lapic_clear_irr ci;
+                    memset(&ci, 0, sizeof(ci));
+                    ci.irr_mask[0] = 0xFFFFFFFF; /* vec 0-31 */
+                    ci.irr_mask[1] = 0xFFFFFFFF; /* vec 32-63 */
+                    ci.irr_mask[2] = 0x00000001; /* vec 64 */
+                    vcpu_ioctl(qcpu->vcpu, VM_LAPIC_CLEAR_IRR, &ci);
                 }
                 /*
                  * Clear stale vatpic (8259) IRQs from firmware.
@@ -2047,30 +2012,14 @@ static int bhyve_vcpu_run(CPUState *cpu) {
          */
         if (qcpu->hwintr_state >= 3 &&
             (qcpu->vcpu_vm_run_total % 50) == 0) {
-            struct vm_lapic_state scrub_lap;
-            memset(&scrub_lap, 0, sizeof(scrub_lap));
-            if (vcpu_ioctl(qcpu->vcpu, VM_LAPIC_GET_STATE,
-                           &scrub_lap) == 0) {
-                int smod = 0;
-                /* Scrub IRR[0] (vectors 0-31: CPU exceptions) */
-                if (scrub_lap.fields[0x20].data != 0) {
-                    scrub_lap.fields[0x20].data = 0;
-                    smod = 1;
-                }
-                /* Scrub ONLY vector 50 (bit 18 in IRR[1]) — PIT */
-                if (scrub_lap.fields[0x21].data & (1u << 18)) {
-                    scrub_lap.fields[0x21].data &= ~(1u << 18);
-                    smod = 1;
-                }
-                /* Scrub vector 64 (bit 0 in IRR[2]) */
-                if (scrub_lap.fields[0x22].data & (1u << 0)) {
-                    scrub_lap.fields[0x22].data &= ~(1u << 0);
-                    smod = 1;
-                }
-                if (smod)
-                    vcpu_ioctl(qcpu->vcpu, VM_LAPIC_SET_STATE,
-                               &scrub_lap);
-            }
+            /*
+             * Use atomic VM_LAPIC_CLEAR_IRR to avoid TOCTOU race.
+             * The old GET_STATE/SET_STATE pattern would read IRR, modify,
+             * then write back — destroying any IRR bits set by pptintr()
+             * (e.g. MSI vector 33) between the read and write.
+             */
+            scrub_lapic_bad_vectors(qcpu->vcpu, cpu->cpu_index,
+                                    qcpu->vcpu_vm_run_total);
         }
 
         /*
@@ -2276,20 +2225,13 @@ static int bhyve_vcpu_run(CPUState *cpu) {
                      * (timer, IPI) to wake up — unconditionally unmask.
                      * Scrub stale IRR first to prevent trap 30 on wakeup.
                      */
-                    struct vm_lapic_state unmask_lapic;
-                    memset(&unmask_lapic, 0, sizeof(unmask_lapic));
-                    if (vcpu_ioctl(qcpu->vcpu, VM_LAPIC_GET_STATE,
-                                   &unmask_lapic) == 0) {
-                        uint32_t saved_apic_id = unmask_lapic.fields[2].data;
-                        for (int i = 0; i < 8; i++) {
-                            if (unmask_lapic.fields[0x20 + i].data != 0) {
-                                unmask_lapic.fields[0x20 + i].data = 0;
-                            }
-                        }
-                        unmask_lapic.fields[2].data = saved_apic_id;
-                        vcpu_ioctl(qcpu->vcpu, VM_LAPIC_SET_STATE,
-                                   &unmask_lapic);
-                    }
+                    /*
+                     * Atomic IRR scrub — preserves live vectors (MSI, IOAPIC).
+                     * Old code cleared ALL 8 IRR registers via GET/SET,
+                     * which destroyed MSI vectors set by pptintr().
+                     */
+                    scrub_lapic_bad_vectors(qcpu->vcpu, cpu->cpu_index,
+                                            qcpu->vcpu_vm_run_total);
                     vm_set_capability(qcpu->vcpu, VM_CAP_MASK_HWINTR, 0);
                     qcpu->hwintr_state = 3;
                     BHYVE_DPRINTF("[HWINTR] vcpu%d state 1→3 (HLT unmask) "
@@ -2403,19 +2345,13 @@ static int bhyve_vcpu_run(CPUState *cpu) {
                 /* If this is our intr_init_final breakpoint, scrub IRR */
                 if (dbg_rip >= 0xffffffff810411f0 &&
                     dbg_rip <= 0xffffffff810411f6) {
-                    struct vm_lapic_state dbg_lapic;
-                    memset(&dbg_lapic, 0, sizeof(dbg_lapic));
-                    if (vcpu_ioctl(qcpu->vcpu, VM_LAPIC_GET_STATE, &dbg_lapic) == 0) {
-                        int scrubbed = 0;
-                        for (int i = 0; i < 8; i++) {
-                            if (dbg_lapic.fields[0x20 + i].data != 0) {
-                                dbg_lapic.fields[0x20 + i].data = 0;
-                                scrubbed = 1;
-                            }
-                        }
-                        if (scrubbed) {
-                            vcpu_ioctl(qcpu->vcpu, VM_LAPIC_SET_STATE, &dbg_lapic);
-                        }
+                    /* Atomic IRR scrub — clear all vectors at debug breakpoint */
+                    {
+                        struct vm_lapic_clear_irr ci;
+                        memset(&ci, 0, sizeof(ci));
+                        for (int i = 0; i < 8; i++)
+                            ci.irr_mask[i] = 0xFFFFFFFF;
+                        vcpu_ioctl(qcpu->vcpu, VM_LAPIC_CLEAR_IRR, &ci);
                     }
                     /* Clear DR0/DR7 — breakpoint no longer needed */
                     vm_set_register(qcpu->vcpu, VM_REG_GUEST_DR0, 0);
@@ -2441,7 +2377,8 @@ static int bhyve_vcpu_run(CPUState *cpu) {
                     qcpu->inout_repeat_count++;
                     uint16_t port = vme.u.inout.port;
                     bool is_acpi_pm = (port >= 0x400 && port <= 0x408) ||
-                                      (port >= 0x600 && port <= 0x608);
+                                      (port >= 0x600 && port <= 0x608) ||
+                                      (port == 0x60 || port == 0x64);
                     if (is_acpi_pm) {
                         /* ACPI PM1 register polling is normal guest behavior */
                         if (!qcpu->pm_timer_warned && qcpu->inout_repeat_count > 1000) {
@@ -3390,7 +3327,14 @@ static void bhyve_update_mapping(hwaddr start_pa, ram_addr_t size,
         if (!rom) {
             prot |= PROT_WRITE;
         }
-        vm_mmap_memseg(mach->vm, start_pa, segoff.seg.segid, segoff.offset, size, prot);
+        int memflags = vm_get_memflags(mach->vm);
+        fprintf(stderr, "bhyve-mmap: %s GPA=0x%lx size=0x%lx segid=%d memflags=0x%x (wired=%d)\n",
+                name, (unsigned long)start_pa, (unsigned long)size,
+                segoff.seg.segid, memflags, !!(memflags & VM_MEM_F_WIRED));
+        int ret = vm_mmap_memseg(mach->vm, start_pa, segoff.seg.segid, segoff.offset, size, prot);
+        if (ret != 0) {
+            fprintf(stderr, "bhyve-mmap: FAILED ret=%d errno=%d (%s)\n", ret, errno, strerror(errno));
+        }
     } else {
         vm_munmap_memseg(mach->vm, start_pa, size);
     }
@@ -3647,7 +3591,7 @@ static int do_open(const char *vmname, MachineState* ms) {
     }
     err = vm_set_topology(mach->vm, ms->smp.sockets, ms->smp.cores, ms->smp.threads, 0);
 
-    vm_set_memflags(mach->vm, 0);
+    vm_set_memflags(mach->vm, VM_MEM_F_WIRED);
 
     /* End Memory */
     return err;
