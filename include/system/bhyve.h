@@ -4,7 +4,7 @@
 #include "exec/cpu-common.h"
 
 #ifdef COMPILING_PER_TARGET
-# ifdef CONFIG_BHYVE
+# if defined(CONFIG_BHYVE) || defined(CONFIG_BHYVE_ARM64)
 #  define CONFIG_BHYVE_IS_POSSIBLE
 # endif
 #else

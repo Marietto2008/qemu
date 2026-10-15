@@ -317,12 +317,14 @@ accelerator_targets += { 'CONFIG_XEN': xen_targets }
 
 if cpu == 'aarch64'
   accelerator_targets += {
-    'CONFIG_HVF': ['aarch64-softmmu']
+    'CONFIG_HVF': ['aarch64-softmmu'],
+    'CONFIG_BHYVE_ARM64': ['aarch64-softmmu'],
   }
 elif cpu == 'x86_64'
   accelerator_targets += {
     'CONFIG_HVF': ['x86_64-softmmu'],
     'CONFIG_BHYVE': ['i386-softmmu', 'x86_64-softmmu'],
+    'CONFIG_BHYVE_ARM64': ['aarch64-softmmu'],
     'CONFIG_NVMM': ['i386-softmmu', 'x86_64-softmmu'],
     'CONFIG_WHPX': ['i386-softmmu', 'x86_64-softmmu'],
     'CONFIG_MSHV': ['x86_64-softmmu'],
@@ -906,6 +908,7 @@ if get_option('bhyve').allowed() and host_os == 'freebsd'
   bhyve = cc.find_library('vmmapi', required: get_option('bhyve'), static: false)
   if bhyve.found()
     accelerators += 'CONFIG_BHYVE'
+    accelerators += 'CONFIG_BHYVE_ARM64'
   endif
 endif
 

@@ -53,6 +53,20 @@ struct BhyvePassthruState {
      * NVIDIA driver reads extended caps through BAR0+0x88000 mirror. */
     uint8_t host_config[4096];
 
+    /*
+     * Capability estese che questo passthrough non sa onorare, e che quindi
+     * non deve far vedere al guest.                        [claude 20/9/2026]
+     *
+     * Vedi bhyve_passthru_hide_ext_caps() nel .c per il perche'.
+     */
+#define BHYVE_PT_EXT_PATCH_MAX  8
+#define BHYVE_PT_EXT_FIRST      0x100
+    struct {
+        uint16_t off;   /* offset dell'intestazione da sostituire */
+        uint32_t val;   /* il dword da restituire al suo posto */
+    } ext_patch[BHYVE_PT_EXT_PATCH_MAX];
+    int ext_npatch;
+
     /* Index into bhyve_passthru_msi_vectors[] for IRR scrub protection, or -1 */
     int msi_scrub_idx;
 

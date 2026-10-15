@@ -121,6 +121,19 @@ struct USBHostDevice {
     /* request queues */
     QTAILQ_HEAD(, USBHostRequest)    requests;
     QTAILQ_HEAD(, USBHostIsoRing)    isorings;
+
+    /* Interrupt IN pre-fetch buffer.
+     * Always keeps a libusb interrupt transfer pending on each interrupt IN
+     * endpoint. If data arrives when no guest transfer is pending, it is
+     * buffered here and delivered immediately on the next guest transfer.
+     * Indexed by endpoint number (1-15). */
+    struct {
+        struct libusb_transfer       *xfer;       /* always-pending transfer */
+        unsigned char                *buf;         /* received data buffer */
+        int                          len;          /* bytes received (0 = empty) */
+        int                          buf_size;     /* allocated buffer size */
+        bool                         active;       /* pre-fetch transfer in-flight */
+    } intr_prefetch[16];
 };
 
 struct USBHostRequest {
@@ -254,8 +267,15 @@ static void usb_host_del_fd(int fd, void *user_data)
     qemu_set_fd_handler(fd, NULL, NULL, NULL);
 }
 
-#else
+#endif /* !CONFIG_WIN32 */
 
+/*
+ * Timer-based fallback polling for libusb event processing.
+ * Always active as a safety net — essential on FreeBSD where
+ * libusb_get_pollfds() returns NULL and pollfd notifiers never fire.
+ * On Linux this is harmless: libusb_handle_events_timeout(tv={0,0})
+ * is a non-blocking no-op when pollfds already handled completions.
+ */
 static QEMUTimer *poll_timer;
 static uint32_t request_count;
 
@@ -264,20 +284,25 @@ static void usb_host_timer_kick(void)
     int64_t delay_ns;
 
     delay_ns = request_count
-        ? (NANOSECONDS_PER_SECOND / 100)  /* 10 ms interval with active req */
-        : (NANOSECONDS_PER_SECOND);       /* 1 sec interval otherwise */
-    timer_mod(poll_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + delay_ns);
+        ? (NANOSECONDS_PER_SECOND / 1000)  /* 1 ms interval with active req */
+        : (NANOSECONDS_PER_SECOND);        /* 1 sec interval otherwise */
+    timer_mod(poll_timer, qemu_clock_get_ns(QEMU_CLOCK_REALTIME) + delay_ns);
 }
+
+static uint64_t timer_call_count;
 
 static void usb_host_timer(void *opaque)
 {
-    struct timeval tv = { 0, 0 };
+    struct timeval tv = { 0, 1000 };  /* 1ms non-blocking poll */
 
+    timer_call_count++;
+    if (request_count > 0 && (timer_call_count % 1000) == 0) {
+        fprintf(stderr, "[usb-host-timer] calls=%lu reqs=%u\n",
+                (unsigned long)timer_call_count, request_count);
+    }
     libusb_handle_events_timeout(ctx, &tv);
     usb_host_timer_kick();
 }
-
-#endif /* !CONFIG_WIN32 */
 
 static int usb_host_init(void)
 {
@@ -298,10 +323,12 @@ static int usb_host_init(void)
 #else
     libusb_set_debug(ctx, loglevel);
 #endif
-#ifdef CONFIG_WIN32
-    poll_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, usb_host_timer, NULL);
+    /* Always set up timer-based polling as a fallback.
+     * Essential on FreeBSD where libusb_get_pollfds() returns NULL. */
+    poll_timer = timer_new_ns(QEMU_CLOCK_REALTIME, usb_host_timer, NULL);
     usb_host_timer_kick();
-#else
+#ifndef CONFIG_WIN32
+    /* Also try fd-based notifications (works on Linux, no-op on FreeBSD) */
     libusb_set_pollfd_notifiers(ctx, usb_host_add_fd,
                                 usb_host_del_fd,
                                 ctx);
@@ -388,18 +415,14 @@ static USBHostRequest *usb_host_req_alloc(USBHostDevice *s, USBPacket *p,
         r->buffer = g_malloc(bufsize);
     }
     QTAILQ_INSERT_TAIL(&s->requests, r, next);
-#ifdef CONFIG_WIN32
     request_count++;
     usb_host_timer_kick();
-#endif
     return r;
 }
 
 static void usb_host_req_free(USBHostRequest *r)
 {
-#ifdef CONFIG_WIN32
     request_count--;
-#endif
     QTAILQ_REMOVE(&r->host->requests, r, next);
     libusb_free_transfer(r->xfer);
     g_free(r->buffer);
@@ -423,6 +446,12 @@ static void LIBUSB_CALL usb_host_req_complete_ctrl(struct libusb_transfer *xfer)
     USBHostRequest *r = xfer->user_data;
     USBHostDevice  *s = r->host;
     bool disconnect = (xfer->status == LIBUSB_TRANSFER_NO_DEVICE);
+
+    fprintf(stderr, "[usb-host-ctrl] complete status=%d len=%d setup=[%02x %02x %04x %04x]\n",
+            xfer->status, xfer->actual_length,
+            xfer->buffer[0], xfer->buffer[1],
+            xfer->buffer[2] | (xfer->buffer[3] << 8),
+            xfer->buffer[4] | (xfer->buffer[5] << 8));
 
     if (r->p == NULL) {
         goto out; /* request was canceled */
@@ -468,14 +497,77 @@ out:
     }
 }
 
+static void usb_host_intr_prefetch_submit(USBHostDevice *s, int ep_nr);
+
 static void LIBUSB_CALL usb_host_req_complete_data(struct libusb_transfer *xfer)
 {
     USBHostRequest *r = xfer->user_data;
     USBHostDevice  *s = r->host;
     bool disconnect = (xfer->status == LIBUSB_TRANSFER_NO_DEVICE);
 
+    fprintf(stderr, "[usb-host-data] complete ep=0x%02x status=%d len=%d type=%d\n",
+            xfer->endpoint, xfer->status, xfer->actual_length, xfer->type);
+
     if (r->p == NULL) {
-        goto out; /* request was canceled */
+        /* Zombie interrupt IN: data arrived after guest cancelled.
+         * Check if there's already a NEW guest transfer pending on this
+         * endpoint — if so, deliver data directly to it. Otherwise buffer. */
+        if (xfer->type == LIBUSB_TRANSFER_TYPE_INTERRUPT &&
+            (xfer->endpoint & USB_DIR_IN) &&
+            (xfer->endpoint & 0x0f) < 16 &&
+            xfer->status == LIBUSB_TRANSFER_COMPLETED &&
+            xfer->actual_length > 0) {
+            int ep_nr = xfer->endpoint & 0x0f;
+
+            /* Look for a pending guest request on the same endpoint */
+            USBHostRequest *guest_r;
+            USBHostRequest *found = NULL;
+            QTAILQ_FOREACH(guest_r, &s->requests, next) {
+                if (guest_r != r && guest_r->p && guest_r->in &&
+                    guest_r->xfer->endpoint == xfer->endpoint) {
+                    found = guest_r;
+                    break;
+                }
+            }
+
+            if (found) {
+                /* Deliver zombie data directly to the waiting guest transfer.
+                 * Cancel its libusb transfer (it hasn't completed yet) and
+                 * complete the guest packet with our data. */
+                USBPacket *fp = found->p;
+                int copy = (xfer->actual_length < (int)fp->iov.size)
+                           ? xfer->actual_length : (int)fp->iov.size;
+                /* Detach guest packet BEFORE completing — when the cancelled
+                 * libusb transfer's completion fires later, it will see
+                 * found->p == NULL and harmlessly go to the zombie/out path. */
+                found->p = NULL;
+                libusb_cancel_transfer(found->xfer);
+                usb_packet_copy(fp, r->buffer, copy);
+                fp->status = USB_RET_SUCCESS;
+                fprintf(stderr, "[usb-zombie] ep=0x%02x DIRECT delivery %d bytes to waiting guest!\n",
+                        xfer->endpoint, copy);
+                trace_usb_host_req_complete(s->bus_num, s->addr, fp,
+                                            fp->status, fp->actual_length);
+                if (usb_host_use_combining(fp->ep)) {
+                    usb_combined_input_packet_complete(USB_DEVICE(s), fp);
+                } else {
+                    usb_packet_complete(USB_DEVICE(s), fp);
+                }
+            } else {
+                /* No guest transfer waiting — buffer for later */
+                if (!s->intr_prefetch[ep_nr].buf) {
+                    s->intr_prefetch[ep_nr].buf_size = 512;
+                    s->intr_prefetch[ep_nr].buf = g_malloc(512);
+                }
+                int copy = (xfer->actual_length < s->intr_prefetch[ep_nr].buf_size)
+                           ? xfer->actual_length : s->intr_prefetch[ep_nr].buf_size;
+                memcpy(s->intr_prefetch[ep_nr].buf, r->buffer, copy);
+                s->intr_prefetch[ep_nr].len = copy;
+                fprintf(stderr, "[usb-zombie] ep=0x%02x BUFFERED %d bytes (no guest waiting)\n",
+                        xfer->endpoint, copy);
+            }
+        }
+        goto out;
     }
 
     r->p->status = status_map[xfer->status];
@@ -491,9 +583,68 @@ static void LIBUSB_CALL usb_host_req_complete_data(struct libusb_transfer *xfer)
     }
 
 out:
+    /* No prefetch auto-submit on cancel: the zombie + DIRECT delivery path
+     * handles data that arrives after guest cancellation.  Prefetch is only
+     * submitted when delivering buffered data to the guest (in handle_data). */
     usb_host_req_free(r);
     if (disconnect) {
         usb_host_nodev(s);
+    }
+}
+
+/* --- Interrupt IN pre-fetch infrastructure --- */
+
+static void LIBUSB_CALL
+usb_host_intr_prefetch_complete(struct libusb_transfer *xfer)
+{
+    USBHostDevice *s = xfer->user_data;
+    int ep_nr = xfer->endpoint & 0x0f;
+
+    s->intr_prefetch[ep_nr].active = false;
+
+    if (xfer->status == LIBUSB_TRANSFER_COMPLETED && xfer->actual_length > 0) {
+        /* Buffer the received data for the next guest transfer */
+        s->intr_prefetch[ep_nr].len = xfer->actual_length;
+        memcpy(s->intr_prefetch[ep_nr].buf, xfer->buffer, xfer->actual_length);
+        fprintf(stderr, "[usb-prefetch] ep=0x%02x buffered %d bytes\n",
+                xfer->endpoint, xfer->actual_length);
+    } else if (xfer->status == LIBUSB_TRANSFER_NO_DEVICE) {
+        return; /* device disconnected, don't resubmit */
+    } else {
+        /* Cancelled or error — resubmit if device still present */
+        if (s->dh) {
+            usb_host_intr_prefetch_submit(s, ep_nr);
+        }
+    }
+}
+
+static void usb_host_intr_prefetch_submit(USBHostDevice *s, int ep_nr)
+{
+    int ep = ep_nr | USB_DIR_IN;
+    int rc;
+
+    fprintf(stderr, "[usb-prefetch] submit ep=0x%02x active=%d dh=%p\n",
+            ep, s->intr_prefetch[ep_nr].active, s->dh);
+
+    if (s->intr_prefetch[ep_nr].active || !s->dh) {
+        return;
+    }
+    if (!s->intr_prefetch[ep_nr].xfer) {
+        s->intr_prefetch[ep_nr].xfer = libusb_alloc_transfer(0);
+        s->intr_prefetch[ep_nr].buf_size = 512;
+        s->intr_prefetch[ep_nr].buf = g_malloc(512);
+    }
+
+    libusb_fill_interrupt_transfer(s->intr_prefetch[ep_nr].xfer,
+                                   s->dh, ep,
+                                   s->intr_prefetch[ep_nr].buf,
+                                   s->intr_prefetch[ep_nr].buf_size,
+                                   usb_host_intr_prefetch_complete, s,
+                                   0 /* unlimited timeout */);
+    rc = libusb_submit_transfer(s->intr_prefetch[ep_nr].xfer);
+    fprintf(stderr, "[usb-prefetch] submit ep=0x%02x rc=%d\n", ep, rc);
+    if (rc == 0) {
+        s->intr_prefetch[ep_nr].active = true;
     }
 }
 
@@ -513,7 +664,19 @@ static void usb_host_req_abort(USBHostRequest *r)
         }
         r->p = NULL;
 
-        libusb_cancel_transfer(r->xfer);
+        /* For interrupt IN: DON'T cancel the libusb transfer.
+         * Keep it running as a "zombie" to capture the dongle's response.
+         * The completion callback will buffer the data for the next
+         * guest transfer. This avoids losing data during the gap between
+         * guest cancel and resubmit. */
+        if (r->xfer->type == LIBUSB_TRANSFER_TYPE_INTERRUPT &&
+            (r->xfer->endpoint & USB_DIR_IN)) {
+            fprintf(stderr, "[usb-zombie] keeping ep=0x%02x alive\n",
+                    r->xfer->endpoint);
+            /* Don't cancel — let it complete naturally */
+        } else {
+            libusb_cancel_transfer(r->xfer);
+        }
     }
 }
 
@@ -1288,6 +1451,19 @@ static void usb_host_cancel_packet(USBDevice *udev, USBPacket *p)
     r = usb_host_req_find(s, p);
     if (r && r->p) {
         r->p = NULL; /* mark as dead */
+
+        /* For interrupt IN: keep the libusb transfer alive ("zombie").
+         * The dongle may send a response (e.g. HCI event) after the guest
+         * cancels the transfer.  If we cancel the libusb transfer too,
+         * that response is lost.  Instead, let it complete naturally —
+         * usb_host_req_complete_data() will buffer the data in
+         * intr_prefetch[] for the next guest transfer. */
+        if (r->in && r->xfer->type == LIBUSB_TRANSFER_TYPE_INTERRUPT) {
+            fprintf(stderr, "[usb-cancel] ep=0x%02x ZOMBIE (keeping libusb xfer alive)\n",
+                    r->xfer->endpoint);
+            return;
+        }
+
         libusb_cancel_transfer(r->xfer);
     }
 }
@@ -1521,6 +1697,14 @@ static void usb_host_handle_control(USBDevice *udev, USBPacket *p,
     libusb_fill_control_transfer(r->xfer, s->dh, r->buffer,
                                  usb_host_req_complete_ctrl, r,
                                  CONTROL_TIMEOUT);
+    /* For HCI commands (class request to device), dump payload bytes */
+    if ((request & 0xff00) == 0x2000 && length >= 3 && !((request >> 8) & USB_DIR_IN)) {
+        fprintf(stderr, "[usb-host-ctrl] submit HCI cmd opcode=0x%02x%02x plen=%d\n",
+                r->buffer[9], r->buffer[8], r->buffer[10]);
+    } else {
+        fprintf(stderr, "[usb-host-ctrl] submit req=0x%04x val=0x%04x idx=0x%04x len=%d\n",
+                request, value, index, length);
+    }
     rc = libusb_submit_transfer(r->xfer);
     if (rc != 0) {
         p->status = USB_RET_NODEV;
@@ -1589,6 +1773,28 @@ static void usb_host_handle_data(USBDevice *udev, USBPacket *p)
         }
         break;
     case USB_ENDPOINT_XFER_INT:
+        /* For interrupt IN: check pre-fetch buffer first */
+        if (p->pid == USB_TOKEN_IN && p->ep->nr < 16 &&
+            s->intr_prefetch[p->ep->nr].len > 0) {
+            int pflen = s->intr_prefetch[p->ep->nr].len;
+            int copy = (pflen < (int)p->iov.size) ? pflen : (int)p->iov.size;
+            usb_packet_copy(p, s->intr_prefetch[p->ep->nr].buf, copy);
+            p->status = USB_RET_SUCCESS;
+            s->intr_prefetch[p->ep->nr].len = 0;
+            fprintf(stderr, "[usb-prefetch] ep=0x%02x delivered %d bytes from buffer\n",
+                    p->ep->nr | USB_DIR_IN, copy);
+            trace_usb_host_req_complete(s->bus_num, s->addr, p,
+                                        p->status, p->actual_length);
+            /* Resubmit prefetch for next time */
+            usb_host_intr_prefetch_submit(s, p->ep->nr);
+            return;
+        }
+        /* Cancel prefetch if active — guest transfer takes over */
+        if (p->pid == USB_TOKEN_IN && p->ep->nr < 16 &&
+            s->intr_prefetch[p->ep->nr].active) {
+            libusb_cancel_transfer(s->intr_prefetch[p->ep->nr].xfer);
+            s->intr_prefetch[p->ep->nr].active = false;
+        }
         r = usb_host_req_alloc(s, p, p->pid == USB_TOKEN_IN, p->iov.size);
         if (!r->in) {
             usb_packet_copy(p, r->buffer, p->iov.size);
@@ -1616,7 +1822,11 @@ static void usb_host_handle_data(USBDevice *udev, USBPacket *p)
     }
 
     rc = libusb_submit_transfer(r->xfer);
+    fprintf(stderr, "[usb-host-submit] ep=0x%02x type=%d size=%d rc=%d reqs=%u\n",
+            r->xfer->endpoint, r->xfer->type, r->xfer->length, rc, request_count);
     if (rc != 0) {
+        fprintf(stderr, "[usb-host-submit] FAILED ep=0x%02x rc=%d\n",
+                r->xfer->endpoint, rc);
         p->status = USB_RET_NODEV;
         trace_usb_host_req_complete(s->bus_num, s->addr, p,
                                     p->status, p->actual_length);

@@ -474,6 +474,134 @@ static bool bhyve_passthru_should_forward_write(BhyvePassthruState *s, uint32_t 
     return true;
 }
 
+/*
+ * Capability estese che questo passthrough non sa onorare.  [claude 20/9/2026]
+ *
+ * Resizable BAR (0x0015): onorarlo vorrebbe dire riallocare lo spazio fisico
+ * della BAR sull'host, rifare la mappatura EPT e aggiornare le dimensioni
+ * note a QEMU. Qui non si fa niente di tutto questo, e le scritture che lo
+ * pilotano finiscono nel nulla. Un guest che vede la capability ridimensiona
+ * la SUA idea della BAR mentre l'hardware resta dov'e'.
+ *
+ * MISURATO su questa macchina, con la Radeon RX 6600:
+ *
+ *     host:   BAR0 prefetchable 64 bit, 256 MB
+ *     guest:  [drm] Detected VRAM RAM=8176M, BAR=8192M
+ *             amdgpu: VRAM: 8176M 0x0000FFFFFF000000 - ...
+ *             kernel BUG at drivers/gpu/drm/amd/amdgpu/gmc_v10_0.c:492!
+ *
+ * Quel BUG_ON scatta su un indirizzo con bit accesi sopra il 47: la base
+ * della VRAM e' spazzatura perche' la BAR non e' dove il driver crede.
+ * Nascondendo la capability il guest torna sulla strada piana dei 256 MB,
+ * la stessa che usa ogni scheda senza ReBAR. E' la stessa cura gia' in
+ * pci_passthru.c del bhyve nativo, dove la Radeon funziona.
+ */
+static const uint16_t bhyve_pt_ext_hidden[] = {
+    0x0015,     /* Resizable BAR */
+};
+
+static void bhyve_passthru_hide_ext_caps(BhyvePassthruState *s)
+{
+    uint32_t hdr, prev_hdr = 0;
+    uint16_t off, next, id, prev_off = 0;
+    int seen, j;
+
+    s->ext_npatch = 0;
+
+    /*
+     * `seen` limita il cammino: una catena corrotta potrebbe girare per
+     * sempre, e non c'e' spazio per piu' capability di cosi'.
+     */
+    for (off = BHYVE_PT_EXT_FIRST, seen = 0;
+         off >= BHYVE_PT_EXT_FIRST && seen < 256; seen++) {
+        bool nascondi = false;
+
+        hdr = host_read_config(s->pcifd, &s->sel, off, 4);
+        if (hdr == 0 || hdr == 0xffffffff) {
+            break;
+        }
+
+        id = hdr & 0xffff;
+        next = (hdr >> 20) & 0xfff;
+
+        for (unsigned i = 0; i < ARRAY_SIZE(bhyve_pt_ext_hidden); i++) {
+            if (bhyve_pt_ext_hidden[i] == id) {
+                nascondi = true;
+                break;
+            }
+        }
+
+        if (nascondi && prev_off == 0) {
+            /*
+             * Sta in testa alla catena: non c'e' nessun predecessore da far
+             * puntare altrove, e 0x100 e' il punto da cui ogni ricerca parte.
+             * Meglio lasciarla che spezzare tutta la catena.
+             */
+            warn_report("bhyve-passthru: %d/%d/%d: la capability estesa "
+                        "0x%04x apre la catena a 0x%03x, non posso nasconderla",
+                        s->sel.pc_bus, s->sel.pc_dev, s->sel.pc_func, id, off);
+            nascondi = false;
+        }
+
+        if (nascondi) {
+            /* L'ultima intestazione tenuta punta oltre questa. */
+            prev_hdr = (prev_hdr & 0x000fffff) | ((uint32_t)next << 20);
+
+            for (j = 0; j < s->ext_npatch; j++) {
+                if (s->ext_patch[j].off == prev_off) {
+                    break;
+                }
+            }
+            if (j == s->ext_npatch) {
+                if (s->ext_npatch >= BHYVE_PT_EXT_PATCH_MAX) {
+                    warn_report("bhyve-passthru: %d/%d/%d: troppe capability "
+                                "estese da nascondere",
+                                s->sel.pc_bus, s->sel.pc_dev, s->sel.pc_func);
+                    break;
+                }
+                s->ext_npatch++;
+            }
+            s->ext_patch[j].off = prev_off;
+            s->ext_patch[j].val = prev_hdr;
+
+            fprintf(stderr, "bhyve-passthru: %d/%d/%d: nascondo la capability "
+                    "estesa 0x%04x a 0x%03x (non so onorarla)\n",
+                    s->sel.pc_bus, s->sel.pc_dev, s->sel.pc_func, id, off);
+        } else {
+            prev_off = off;
+            prev_hdr = hdr;
+        }
+
+        off = next;
+    }
+}
+
+/*
+ * Sostituisce un'intestazione riscritta quando il guest la legge.
+ *
+ * Le letture di configurazione sono allineate per natura, quindi una lettura
+ * non sta mai a cavallo di due dword: o cade dentro una, o le manca tutte.
+ */
+static bool bhyve_passthru_ext_fixup(BhyvePassthruState *s, uint32_t address,
+                                     int len, uint32_t *valore)
+{
+    for (int i = 0; i < s->ext_npatch; i++) {
+        uint32_t off = s->ext_patch[i].off;
+
+        if (address >= off && address + len <= off + 4) {
+            uint32_t v = s->ext_patch[i].val >> ((address - off) * 8);
+
+            switch (len) {
+            case 1: *valore = v & 0xff; break;
+            case 2: *valore = v & 0xffff; break;
+            default: *valore = v; break;
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
 static uint32_t bhyve_passthru_read_config(PCIDevice *pci_dev, uint32_t address, int len)
 {
     BhyvePassthruState *s = BHYVE_PASSTHRU(pci_dev);
@@ -492,6 +620,17 @@ static uint32_t bhyve_passthru_read_config(PCIDevice *pci_dev, uint32_t address,
         }
         return val;
     }
+    /*
+     * Capability estese nascoste: si restituisce l'intestazione riscritta,
+     * altrimenti il guest le vedrebbe leggendo dal dispositivo vero.
+     */
+    if (address >= BHYVE_PT_EXT_FIRST) {
+        uint32_t patched;
+        if (bhyve_passthru_ext_fixup(s, address, len, &patched)) {
+            return patched;
+        }
+    }
+
     /* Non-emulated: live read from physical device */
     return host_read_config(s->pcifd, &s->sel, address, len);
 }
@@ -656,6 +795,12 @@ static void bhyve_passthru_realize(PCIDevice *pci_dev, Error **errp)
     }
     /* Store in struct for runtime config reads */
     memcpy(s->host_config, cached_config, 4096);
+
+    /*
+     * Percorre la catena estesa e prepara le intestazioni da riscrivere.
+     * Va fatto QUI: dopo vm_assign_pptdev() la PCIOCREAD non risponde piu'.
+     */
+    bhyve_passthru_hide_ext_caps(s);
 
 
     /* Cache BAR info */

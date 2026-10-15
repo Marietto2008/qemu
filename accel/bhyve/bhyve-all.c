@@ -2378,7 +2378,8 @@ static int bhyve_vcpu_run(CPUState *cpu) {
                     uint16_t port = vme.u.inout.port;
                     bool is_acpi_pm = (port >= 0x400 && port <= 0x408) ||
                                       (port >= 0x600 && port <= 0x608) ||
-                                      (port == 0x60 || port == 0x64);
+                                      (port == 0x60 || port == 0x64) ||
+                                      (port >= 0xb0 && port <= 0xb7);
                     if (is_acpi_pm) {
                         /* ACPI PM1 register polling is normal guest behavior */
                         if (!qcpu->pm_timer_warned && qcpu->inout_repeat_count > 1000) {
@@ -3336,7 +3337,34 @@ static void bhyve_update_mapping(hwaddr start_pa, ram_addr_t size,
             fprintf(stderr, "bhyve-mmap: FAILED ret=%d errno=%d (%s)\n", ret, errno, strerror(errno));
         }
     } else {
-        vm_munmap_memseg(mach->vm, start_pa, size);
+        /*
+         * ★★ claude 15/10/2026 -- QUESTO RAMO ERA MUTO.
+         *
+         * Il 15/10 QEMU con la GPU passata faceva due passate sulla memoria:
+         * la prima riusciva (pc.ram 0x0+0x80000000, 0x100000000+0x180000000),
+         * la seconda -- con la spartizione classica del PC -- falliva tutta:
+         *
+         *     pc.ram GPA=0x0      size=0xc0000     -> errno=17 EEXIST
+         *     pc.rom GPA=0xc0000                   -> errno=12 ENOMEM
+         *     flash0 GPA=0xe0000                   -> errno=12
+         *     pc.ram GPA=0x100000 size=0x7ff00000  -> errno=12
+         *
+         * Il sospetto e' che lo smontaggio non avvenga, perche'
+         * vm_munmap_memseg() nel kernel pretende che gpa E lunghezza
+         * coincidano ESATTAMENTE con una mappatura esistente:
+         *
+         *     if (m->gpa == gpa && m->len == len) { ...; return (0); }
+         *     return (EINVAL);
+         *
+         * Smontare 0x0+0xc0000 quando la mappatura e' 0x0+0x80000000 torna
+         * EINVAL e non smonta niente.  Ma qui il valore di ritorno veniva
+         * BUTTATO VIA, quindi non si poteva nemmeno sapere se region_del
+         * fosse chiamata.  Adesso si vede.
+         */
+        int ret = vm_munmap_memseg(mach->vm, start_pa, size);
+        fprintf(stderr, "bhyve-munmap: %s GPA=0x%lx size=0x%lx -> %d%s\n",
+                name, (unsigned long)start_pa, (unsigned long)size, ret,
+                ret != 0 ? " ★ FALLITO (la mappatura resta!)" : "");
     }
 }
 

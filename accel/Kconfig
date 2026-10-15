@@ -7,6 +7,9 @@ config NVMM
 config BHYVE
     bool
 
+config BHYVE_ARM64
+    bool
+
 config HVF
     bool
 

@@ -74,7 +74,13 @@ config MACIO
 config IVSHMEM_DEVICE
     bool
     default y if PCI_DEVICES
-    depends on PCI && LINUX && IVSHMEM && MSI_NONBROKEN
+    # `LINUX` tolto.                                   [claude 20/9/2026]
+    # QEMU esclude ivshmem su tutti gli host non-Linux in blocco, ma il
+    # vincolo vero e' `IVSHMEM`, che a sua volta dipende da CONFIG_EVENTFD --
+    # e FreeBSD 13+ eventfd() ce l'ha davvero (eventfd@@FBSD_1.6 in libc).
+    # `ivshmem-plain`, che e' quello che serve qui, non usa niente di
+    # specifico di Linux: e' una BAR PCI su un file mappato in memoria.
+    depends on PCI && IVSHMEM && MSI_NONBROKEN
 
 config IVSHMEM_FLAT_DEVICE
     bool
